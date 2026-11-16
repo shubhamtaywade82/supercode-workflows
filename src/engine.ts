@@ -1,4 +1,5 @@
 import { evalCondition, execShell, interpolate, resolveUpdater, StepTimeoutError } from "./updaters.js";
+import { RtkError, type RtkAdapter } from "./rtk.js";
 import type { AiClient, ConfirmPreview, EngineEvent, HostAdapter, Registry, RunResult, Step, TurnRequest, TurnResult, WorkflowState } from "./types.js";
 
 export interface EngineOptions {
@@ -14,6 +15,8 @@ export interface EngineOptions {
   stepTimeoutMs?: number;   // default 5 min
   abortConfirmMs?: number;  // after a turn times out, how long the host gets to confirm it stopped; default 10 s
   onEvent?: (e: EngineEvent) => void;
+  /** Required only by steps that set rtk: true. Without it, such a step fails closed before anything runs. */
+  rtk?: RtkAdapter;
 }
 
 interface RunCtx { name: string; state: WorkflowState; steps: number; started: number; deadline: number; maxSteps: number }
@@ -83,6 +86,16 @@ export class WorkflowEngine {
     throw new StepTimeoutError(`agent turn "${label}" timed out after ${ms}ms`);
   }
 
+  /**
+   * The command a shell step runs. An rtk step is rewritten here, before confirmation. No adapter means the step fails
+   * closed: it never runs unwrapped by accident.
+   */
+  private async shellCommand(raw: string, step: Step, label: string): Promise<string> {
+    if (!step.rtk) return raw;
+    if (!this.o.rtk) throw new RtkError("unavailable", `step "${label}" sets rtk: true, but no RTK adapter is configured`);
+    return this.o.rtk.prepare(raw);
+  }
+
   private emit(e: EngineEvent): void { this.o.onEvent?.(e); }
   private env(): Record<string, string> { return this.o.env ?? {}; }
 
@@ -117,20 +130,23 @@ export class WorkflowEngine {
     const wantsTurn = !wantsShell && step.ref === undefined
       && (step.run ?? step.instantRun ?? !isRoot)
       && (step.prompt !== undefined || step.run === true || step.instantRun === true);
+    if (step.rtk && !wantsShell) throw new Error(`step "${label}": rtk applies only to shell steps`);
+    // Fixed before confirmation, so the preview shows the command that will actually run, including any rtk rewrite.
+    const command = wantsShell ? await this.shellCommand(interpolate(step.shell as string, s, this.env()), step, label) : undefined;
 
     if ((wantsTurn || wantsShell) && step.requireConfirm) {
       const preview: ConfirmPreview = {
         workflow: ctx.name, step: label, kind: wantsShell ? "shell" : "agent-turn",
         prompt: wantsTurn ? s.prompt : undefined,
-        command: wantsShell ? interpolate(step.shell as string, s, this.env()) : undefined,
+        command,
         model: s.model, mode: s.mode,
       };
       const ok = this.o.confirm ? await this.o.confirm(preview) : false; // headless default: deny
       if (!ok) { this.emit({ type: "step:skip", workflow: ctx.name, step: label, reason: "confirm-denied" }); return; }
     }
 
-    if (wantsShell) {
-      const r = await execShell(interpolate(step.shell as string, s, this.env()), { env: this.env(), cwd: this.o.cwd, timeoutMs: t });
+    if (command !== undefined) {
+      const r = await execShell(command, { env: this.env(), cwd: this.o.cwd, timeoutMs: t });
       s.response = r.stdout.trimEnd();
       s.packed.push({ role: "tool", name: "shell", content: s.response });
       if (r.code !== 0 && !step.continueOnError) throw new Error(`shell step "${label}" exited ${r.code}: ${r.stderr.trim()}`);

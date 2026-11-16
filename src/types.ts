@@ -26,6 +26,12 @@ export interface Step {
   actions?: string[];
   steps?: Step[];
   loop?: { while: Condition; maxIterations: number };
+  /**
+   * Run this shell step's command through an installed rtk binary (`rtk rewrite`). Opt-in, default false, shell steps only.
+   * Host hooks do not reach engine shell steps, so this is the only way such a step is rewritten. Gate steps still gate on
+   * the exit code, which the rewrite must preserve.
+   */
+  rtk?: boolean;
 }
 
 export interface Workflow extends Step {

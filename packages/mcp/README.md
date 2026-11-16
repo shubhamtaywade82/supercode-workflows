@@ -77,6 +77,7 @@ Nothing changes without `--apply`. Codex config is never written automatically. 
 4. **The run deadline is checked between steps only.** A long single turn runs until its own timeout (5 minutes by default). A run can therefore exceed `--deadline-ms` by up to one turn.
 5. **Permissions are explicit.** Side-effecting runs on Claude require `--permission-mode`, and the server refuses them without it. Headless Claude turns pass `--permission-prompts none` (Claude Code 2.1.259 or later), so a prompt that nobody can answer is denied, not waited on. Codex runs with `approval_policy="never"` and `workspace-write` by default.
 6. **Live evidence covers Claude only, and only through the workflows CLI.** `scripts/smoke-live.sh` ran against Claude Code 2.1.325: an `acceptEdits` write completes, `plan` writes nothing, and an unapproved shell command is denied without hanging. Codex has not been run live, and no MCP client (Claude Code or Codex) has driven this server yet. The protocol path is covered by in-memory and stdio tests.
+7. **No RTK in MCP runs.** The server does not wire an RTK adapter. A workflow step with `rtk: true` fails closed before its command runs, with an `RtkError` of kind `unavailable`. Use the `scwf` CLI with `--rtk-bin` for that option.
 
 ## Development
 
