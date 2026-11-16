@@ -11,8 +11,8 @@ A deterministic, host-agnostic workflow executor for AI coding agents. Steps run
 
 ## Status: 0.1.0
 
-- Verified by the test suite (`npm test`, 14 `node:test` behavioral tests): engine semantics, updaters, conditions, budgets, loader, confirm gate, and URL/AI updaters against local test servers and mocks.
-- Not verified against live services: the Claude Code and Codex adapters parse output formats that have not been checked against current CLI releases. The Ollama and OpenAI-compatible clients are not exercised by tests.
+- Verified by the test suite (`npm test`, 19 `node:test` behavioral tests): engine semantics, updaters, conditions, budgets, loader, confirm gate, URL/AI updaters against local test servers and mocks, and Claude Code / Codex adapter parsing against recorded event fixtures.
+- Not verified against live services: the adapter tests use recorded fixtures, not installed CLIs. CLI flag names (`--sandbox`, `--permission-mode`) and authentication have not been checked against specific CLI releases. The Ollama and OpenAI-compatible clients are not exercised by tests.
 
 ## Usage
 
@@ -51,6 +51,7 @@ Variables: `$prompt`, `$systemPrompt`, `$response`, `$packedResponses`, `$model`
 
 - Workflows are trusted code, as in any agent-automation system. Review workflow files before running them.
 - `shell` steps run under `/bin/bash` with your privileges.
+- `--host codex` runs `codex exec` with `--sandbox workspace-write` by default, so agent steps can edit files in the project. `--host claude` uses the CLI's own permission mode unless `permissionMode` is set in the adapter options. Run autonomous workflows in an isolated checkout or runner.
 - `js` snippets run in `node:vm` with a timeout. `vm` is not a security boundary.
 - `url` updaters and conditions send the current prompt and response to the URL you configure.
 - Steps marked `requireConfirm` are denied unless a `confirm` callback approves them.

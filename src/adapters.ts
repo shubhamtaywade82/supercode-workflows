@@ -4,6 +4,13 @@ import type { AiClient, HostAdapter, TurnRequest, TurnResult } from "./types.js"
 
 const pExecFile = promisify(execFile);
 
+/** Injectable process executor — lets tests feed recorded fixtures without the real CLIs. */
+export type ExecFn = (bin: string, args: string[], opts: { cwd?: string; maxBuffer?: number }) => Promise<{ stdout: string }>;
+const defaultExec: ExecFn = async (bin, args, opts) => {
+  const { stdout } = await pExecFile(bin, args, { cwd: opts.cwd, maxBuffer: opts.maxBuffer });
+  return { stdout: String(stdout) };
+};
+
 export class MockHost implements HostAdapter {
   readonly turns: TurnRequest[] = [];
   resets = 0;
@@ -54,40 +61,58 @@ export class OpenAiCompatAi implements AiClient {
   }
 }
 
+interface ClaudeResult { result?: string; session_id?: string; is_error?: boolean; subtype?: string }
+
 /** Claude Code headless adapter (`claude -p --output-format json`). Requires the claude CLI. */
 export class ClaudeCodeAdapter implements HostAdapter {
   private sessionId?: string;
-  constructor(private readonly opts: { bin?: string; cwd?: string } = {}) {}
+  private readonly exec: ExecFn;
+  constructor(private readonly opts: {
+    bin?: string; cwd?: string; exec?: ExecFn;
+    permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
+  } = {}) { this.exec = opts.exec ?? defaultExec; }
+
   async sendTurn(req: TurnRequest): Promise<TurnResult> {
     const args = ["-p", req.prompt, "--output-format", "json"];
     if (req.model) args.push("--model", req.model);
     if (req.systemPrompt) args.push("--append-system-prompt", req.systemPrompt);
+    if (this.opts.permissionMode) args.push("--permission-mode", this.opts.permissionMode);
     if (this.sessionId) args.push("--resume", this.sessionId);
-    const { stdout: raw } = await pExecFile(this.opts.bin ?? "claude", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024 });
-    const parsed = JSON.parse(String(raw)) as { result?: string; session_id?: string };
+    const { stdout } = await this.exec(this.opts.bin ?? "claude", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024 });
+    const parsed = JSON.parse(stdout) as ClaudeResult;
     if (parsed.session_id) this.sessionId = parsed.session_id;
+    if (parsed.is_error) throw new Error(`claude turn error (${parsed.subtype ?? "unknown"}): ${parsed.result ?? ""}`);
     const text = parsed.result ?? "";
     return { text, messages: [{ role: "assistant", content: text }] };
   }
   resetContext(): void { this.sessionId = undefined; }
 }
 
+interface CodexEvent { type?: string; message?: string; error?: { message?: string }; item?: { type?: string; text?: string } }
+
 /** Codex headless adapter (`codex exec --json`). Each exec is a fresh session; carry history via $packedResponses. */
 export class CodexAdapter implements HostAdapter {
-  constructor(private readonly opts: { bin?: string; cwd?: string } = {}) {}
+  private readonly exec: ExecFn;
+  constructor(private readonly opts: {
+    bin?: string; cwd?: string; exec?: ExecFn; model?: string;
+    sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+  } = {}) { this.exec = opts.exec ?? defaultExec; }
+
   async sendTurn(req: TurnRequest): Promise<TurnResult> {
-    const args = ["exec", "--json", "--skip-git-repo-check"];
-    if (req.model) args.push("-m", req.model);
+    // Default workspace-write so implementation steps can edit files; read-only for review-only workflows.
+    const args = ["exec", "--json", "--skip-git-repo-check", "--sandbox", this.opts.sandbox ?? "workspace-write"];
+    const model = req.model ?? this.opts.model;
+    if (model) args.push("-m", model);
     args.push(req.systemPrompt ? `${req.systemPrompt}\n\n${req.prompt}` : req.prompt);
-    const { stdout: raw } = await pExecFile(this.opts.bin ?? "codex", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await this.exec(this.opts.bin ?? "codex", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024 });
     let text = "";
-    for (const line of String(raw).split("\n")) {
+    for (const line of stdout.split("\n")) {
       if (!line.trim()) continue;
-      try {
-        const ev = JSON.parse(line) as { item?: { type?: string; text?: string }; msg?: { type?: string; message?: string } };
-        if (ev.item?.type === "agent_message" && ev.item.text) text = ev.item.text;
-        else if (ev.msg?.type === "agent_message" && ev.msg.message) text = ev.msg.message;
-      } catch { /* non-JSON line */ }
+      let ev: CodexEvent;
+      try { ev = JSON.parse(line) as CodexEvent; } catch { continue; }
+      if (ev.type === "turn.failed") throw new Error(`codex turn failed: ${ev.error?.message ?? "unknown"}`);
+      if (ev.type === "error" && !/^Reconnecting/i.test(ev.message ?? "")) throw new Error(`codex stream error: ${ev.message ?? "unknown"}`);
+      if (ev.type === "item.completed" && ev.item?.type === "agent_message" && typeof ev.item.text === "string") text = ev.item.text;
     }
     return { text, messages: [{ role: "assistant", content: text }] };
   }
