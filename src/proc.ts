@@ -33,7 +33,12 @@ export function onGroupEvent(listener: (e: GroupEvent) => void): () => void {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** Linux /proc facts about one process. Undefined on other platforms, or when the process is gone. */
+/** /proc is authoritative where it exists. In practice that means Linux. */
+function procAvailable(): boolean {
+  return process.platform === "linux" && fs.existsSync("/proc/self/stat");
+}
+
+/** Linux /proc facts about one process. Undefined when /proc is unavailable or the process has no entry. */
 export interface ProcStat {
   state: string;
   pgrp: number;
@@ -42,7 +47,7 @@ export interface ProcStat {
 }
 
 export function readProcStat(pid: number): ProcStat | undefined {
-  if (process.platform !== "linux") return undefined;
+  if (!procAvailable()) return undefined;
   try {
     const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     // "pid (comm) state ppid pgrp ... starttime": comm may hold spaces and parentheses, so anchor on the last ")".
@@ -50,6 +55,27 @@ export function readProcStat(pid: number): ProcStat | undefined {
     return { state: f[0], pgrp: Number(f[2]), starttime: Number(f[19]) };
   } catch {
     return undefined;
+  }
+}
+
+/**
+ * Is this process running? With /proc: it must exist, must not be a zombie (Z) or dead (X), and, if a start time is given,
+ * must be the same process. A zombie has exited and only waits for its reaper, so it is not alive. Without /proc,
+ * kill(pid, 0) is all there is. It cannot tell a zombie from a live process, so a zombie holder reads as alive there.
+ * That fails closed: the lock blocks rather than reclaiming.
+ */
+export function processAlive(pid: number, starttime?: number): boolean {
+  if (procAvailable()) {
+    const st = readProcStat(pid);
+    if (!st) return false;
+    if (st.state.startsWith("Z") || st.state.startsWith("X")) return false;
+    return starttime === undefined || st.starttime === starttime;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM"; // exists, owned by another user
   }
 }
 
@@ -61,7 +87,7 @@ interface Member { pid: number; state: string }
  * group would look alive for seconds, or forever.
  */
 function groupMembers(pgid: number): Member[] {
-  if (process.platform === "linux") {
+  if (procAvailable()) {
     const members: Member[] = [];
     for (const entry of fs.readdirSync("/proc")) {
       if (!/^\d+$/.test(entry)) continue;
@@ -97,7 +123,7 @@ export type GroupStatus = "empty" | "ours" | "unverifiable";
  */
 export function groupStatus(pgid: number, leaderStart?: number): GroupStatus {
   if (!groupAlive(pgid)) return "empty";
-  if (process.platform !== "linux") return "unverifiable";
+  if (!procAvailable()) return "unverifiable";
   const leader = readProcStat(pgid);
   if (!leader) return "unverifiable";
   if (leaderStart === undefined) return "unverifiable";
@@ -126,6 +152,11 @@ async function waitGroupGone(pgid: number, ms: number): Promise<boolean> {
  * Ends every remaining member of a process group: SIGTERM, a grace period, then SIGKILL.
  * Resolves true only when the group is empty. Resolves false when members survive SIGKILL (for example, uninterruptible
  * sleep in the kernel), so the caller can report that honestly instead of claiming a clean stop.
+ *
+ * Why it is safe to call after the leader has been reaped: the leader's start time is no longer readable then, so identity
+ * is carried by the kernel instead. A process-group id stays reserved while any process still uses it, so while members
+ * exist, no unrelated process can take that id. Signals are sent only after members are found, so nothing is sent to an
+ * empty id.
  */
 export async function terminateGroup(pgid: number): Promise<boolean> {
   if (!groupAlive(pgid)) return true;
@@ -136,8 +167,8 @@ export async function terminateGroup(pgid: number): Promise<boolean> {
 }
 
 /**
- * Synchronously SIGKILLs every group this process started and has not yet seen end. Used on shutdown, before any lock is
- * released, so that a released lock never coincides with a running agent.
+ * Synchronously SIGKILLs every group this process started and has not yet seen end, then waits briefly for them to be gone.
+ * Used on shutdown, before any lock is released, so that a released lock never coincides with a running agent.
  */
 export function killLiveGroupsNow(): void {
   const pgids = [...LIVE_GROUPS];
@@ -186,15 +217,20 @@ export interface RunOutcome {
 
 /**
  * Runs a process as the leader of its own process group. When this resolves, no member of that group is still running.
- * Abort, timeout, and output overflow send SIGTERM to the group, escalate to SIGKILL after a grace period, and resolve
- * only once the group is empty. Stray members left after a normal exit are ended too: a turn is over when it returns.
+ *
+ * Every stop (abort, timeout, output overflow, or a failure after spawn) goes through one routine. It sends SIGTERM to the
+ * group, then SIGKILL after the grace period, whether or not the leader has exited. A leader that traps or ignores SIGTERM
+ * is therefore still ended. The promise settles only once the leader has exited and the group is empty. A stop that the
+ * leader survives long after SIGKILL settles with an error rather than hanging.
  *
  * Rejects when:
  * - the group survives SIGKILL (the error names the group; treat it as possibly still writing),
  * - a group listener throws (for example, the lock could not record the group, so the group is killed first),
- * - the process fails to spawn.
+ * - the process fails to spawn, or fails after spawning (the group is ended first),
+ * - the leader does not exit within a bounded time after a stop request.
  *
- * Scope: POSIX only. On Windows there is no process group here, and only the direct child is ended.
+ * Scope: POSIX only. On Windows there is no process group here, and only the direct child is ended. The MCP server
+ * refuses side-effecting runs there for that reason.
  * Limit: group membership is what is guaranteed. A descendant that calls setsid or setpgid leaves the group, and it is not
  * ended. A plain background job (`&`) stays in the group, and is ended.
  */
@@ -219,26 +255,66 @@ export function runProcess(bin: string, args: string[], opts: RunOptions = {}): 
     let timedOut = false;
     let overflow = false;
     let failure: Error | undefined;
+    let stopping = false; // a stop has been requested
+    let exitSeen = false; // the leader has exited
+    let settled = false;  // the promise has settled
     let stdout = "";
     let stderr = "";
     const outDecoder = new StringDecoder("utf8");
     const errDecoder = new StringDecoder("utf8");
+    let escalation: NodeJS.Timeout | undefined;
+    let hardStop: NodeJS.Timeout | undefined;
+    let runTimer: NodeJS.Timeout | undefined;
 
-    const stopLeader = (): void => {
-      if (pgid !== undefined) signalGroup(pgid, "SIGTERM");
-      else child.kill("SIGTERM");
+    const onAbort = (): void => {
+      aborted = true;
+      stopGroup();
     };
-    const timer = opts.timeoutMs === undefined
+
+    /** Settles once. Clears every timer and the abort listener, so nothing outlives the run. */
+    const settle = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(runTimer);
+      clearTimeout(escalation);
+      clearTimeout(hardStop);
+      opts.signal?.removeEventListener("abort", onAbort);
+      fn();
+    };
+
+    /**
+     * The one stop routine. SIGTERM now, SIGKILL after the grace period, regardless of whether the leader has exited. Idempotent.
+     * If the leader has not exited well after SIGKILL, the run settles with an error instead of hanging.
+     */
+    const stopGroup = (): void => {
+      if (stopping || settled) return;
+      stopping = true;
+      if (pgid === undefined) {
+        child.kill("SIGTERM");
+        escalation = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
+      } else {
+        signalGroup(pgid, "SIGTERM");
+        escalation = setTimeout(() => signalGroup(pgid, "SIGKILL"), KILL_GRACE_MS);
+      }
+      hardStop = setTimeout(() => {
+        if (!exitSeen) {
+          settle(() => reject(failure ?? new Error(
+            `${bin} did not exit within ${2 * KILL_GRACE_MS} ms of a stop request; its process group may still be running`,
+          )));
+        }
+      }, 2 * KILL_GRACE_MS + 500);
+    };
+
+    runTimer = opts.timeoutMs === undefined
       ? undefined
-      : setTimeout(() => { timedOut = true; stopLeader(); }, opts.timeoutMs);
-    const onAbort = (): void => { aborted = true; stopLeader(); };
+      : setTimeout(() => { timedOut = true; stopGroup(); }, opts.timeoutMs);
     opts.signal?.addEventListener("abort", onAbort, { once: true });
 
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += outDecoder.write(chunk);
       if (stdout.length > maxBuffer && !overflow) {
         overflow = true;
-        stopLeader();
+        stopGroup();
       }
     });
     child.stderr.on("data", (chunk: Buffer) => {
@@ -246,51 +322,48 @@ export function runProcess(bin: string, args: string[], opts: RunOptions = {}): 
     });
     const closed = new Promise<void>((done) => child.once("close", () => done()));
 
-    const cleanup = (emptied: boolean): void => {
-      if (timer) clearTimeout(timer);
-      opts.signal?.removeEventListener("abort", onAbort);
-      // A group that survived stays tracked, so shutdown still kills it.
-      if (pgid !== undefined && emptied) LIVE_GROUPS.delete(pgid);
-    };
-
     if (pgid !== undefined) {
-      // Listeners run before the group is trusted. If one throws, the group is killed and the run fails.
+      // Listeners run before the group is trusted. If one throws, the group is ended and the run fails.
       try {
         for (const l of [...LISTENERS]) l({ type: "start", pgid, leaderStart });
       } catch (e) {
         failure = e instanceof Error ? e : new Error(String(e));
-        signalGroup(pgid, "SIGKILL");
+        stopGroup();
       }
     }
 
     child.once("error", (e) => {
-      cleanup(true);
-      reject(e);
+      if (pgid === undefined) {
+        settle(() => reject(e)); // never spawned
+        return;
+      }
+      // Spawned, then failed: the group may still be running. End it. The exit path reports the failure.
+      failure = failure ?? e;
+      stopGroup();
     });
+
     child.once("exit", (code) => {
+      exitSeen = true;
       void (async () => {
-        // The leader is gone, but its children may not be. End them before reporting anything.
+        // The leader is gone, but its children may not be. End them before reporting anything. Signalling here is safe for
+        // the reason given on terminateGroup.
         const empty = pgid === undefined ? true : await terminateGroup(pgid);
         await Promise.race([closed, sleep(CLOSE_GRACE_MS)]);
         stdout += outDecoder.end();
         stderr = (stderr + errDecoder.end()).slice(-STDERR_KEEP);
-        cleanup(empty);
-        if (empty && pgid !== undefined) {
+        if (pgid !== undefined && empty) {
+          LIVE_GROUPS.delete(pgid); // a group that survived stays tracked, so shutdown still kills it
           try {
             for (const l of [...LISTENERS]) l({ type: "end", pgid });
           } catch {
             /* the next acquirer classifies a recorded group that is gone as "empty" */
           }
         }
-        if (failure) {
-          reject(failure);
-          return;
-        }
-        if (!empty) {
-          reject(new Error(`process group ${pgid} survived SIGKILL; ${bin} may still be writing to the project`));
-          return;
-        }
-        resolve({ code, stdout, stderr, aborted, timedOut, overflow });
+        settle(() => {
+          if (failure) reject(failure);
+          else if (!empty) reject(new Error(`process group ${pgid} survived SIGKILL; ${bin} may still be writing to the project`));
+          else resolve({ code, stdout, stderr, aborted, timedOut, overflow });
+        });
       })();
     });
   });

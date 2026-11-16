@@ -6,6 +6,7 @@ import {
   groupStatus,
   killLiveGroupsNow,
   onGroupEvent,
+  processAlive,
   readProcStat,
   terminateGroup,
 } from "@nemesis-oss/supercode-workflows";
@@ -38,6 +39,7 @@ import { GuardError } from "./guard.js";
  *   an operator ends them.
  * - The ledger window is fixed: it starts at the first charge after the previous window expired. A project can therefore
  *   spend up to 2x the budget across a window boundary.
+ * - The ledger's read-check-write is safe only because the lock serializes runs. Nothing else may charge the ledger.
  */
 
 export interface ProjectLockOptions {
@@ -135,17 +137,12 @@ function parseRecord(raw: string): LockRecord | undefined {
   }
 }
 
-/** Is the recorded holder still the same process? Same PID and same start time, or, without /proc, a live PID. */
+/**
+ * Is the recorded holder still running as the same process? A zombie holder has exited and is dead. A reused PID has a
+ * different start time, so it is a different process, and the holder is gone.
+ */
 function holderAlive(rec: LockRecord): boolean {
-  try {
-    process.kill(rec.pid, 0);
-  } catch (e) {
-    if (errCode(e) !== "EPERM") return false; // gone
-  }
-  if (rec.start === undefined) return true; // no identity recorded: assume alive, fail closed
-  const st = readProcStat(rec.pid);
-  if (!st) return true;                      // exists but identity unreadable: assume alive, fail closed
-  return st.starttime === rec.start;         // a reused PID has a different start time: the holder is gone
+  return processAlive(rec.pid, rec.start);
 }
 
 /** Ends every recorded group that is provably ours. Resolves false if any group cannot be proven or ended. */
@@ -187,12 +184,16 @@ function reclaim(dir: string, lockPath: string, judged: string): void {
     if (errCode(e) === "ENOENT") return; // someone else already removed it
     throw e;
   }
-  if (readText(tomb) !== judged) {
-    try {
-      fs.linkSync(tomb, lockPath);
-    } catch {
-      /* a newer claimant holds the slot; see the residual note */
-    }
+  if (readText(tomb) === judged) {
+    fs.rmSync(tomb, { force: true });
+    return;
+  }
+  // We displaced a claim published after the judgement. Put it back only if the slot is still empty. If it is not, keep the
+  // displaced record on disk: deleting it would erase the evidence of the residual race.
+  try {
+    fs.linkSync(tomb, lockPath);
+  } catch {
+    throw new GuardError("busy", `a lock claim was displaced while being reclaimed and is kept at ${tomb} for inspection`);
   }
   fs.rmSync(tomb, { force: true });
 }

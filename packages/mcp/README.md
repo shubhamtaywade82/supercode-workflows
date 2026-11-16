@@ -34,7 +34,7 @@ Every `workflow_run` passes these checks, in this order. A refusal at any step l
 ### How the project lock behaves
 
 - **Atomic claim.** A claim is written to a temp file and hard-linked into place, so readers never see a partial record. This needs a filesystem with hard links.
-- **Holder identity is PID plus start time (Linux).** A reused PID has a different start time, so a dead holder is recognised and its lock is reclaimed. A live holder is never reclaimed by age, because a run's length is not bounded by its deadline.
+- **Holder identity is PID plus start time (Linux).** A reused PID has a different start time, so a dead holder is recognised and its lock is reclaimed. A zombie holder (exited, not yet reaped) counts as dead. Without `/proc`, a zombie holder reads as alive and blocks, which fails closed. A live holder is never reclaimed by age, because a run's length is not bounded by its deadline.
 - **Agent groups are recorded, and cleared before reclaim.** Each agent process group is written into the lock as it starts, and removed as it ends. Before a dead holder's lock is reclaimed, its recorded groups are ended, but only where ownership can be proven. A group that cannot be proven or ended blocks the new run, and the error names the group ids. An orphaned agent therefore cannot run alongside a second run.
 - **Dead holders are reclaimed.** A lock whose holder PID is gone, on this host, is reclaimed at once.
 - **Other hosts.** A lock from another host is reclaimed only after 2 hours (`staleRemoteMs`), and never while it records agent groups, since those cannot be checked from here. An unreadable lock record always blocks. Check that no run is active, then delete it.
