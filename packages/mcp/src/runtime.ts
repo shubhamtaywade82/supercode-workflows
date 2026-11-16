@@ -43,8 +43,8 @@ export interface Runtime {
   loadProject(): { registry: Registry; env: Record<string, string> };
   /** Agent host for one run. `onTurn` runs before each turn and is used to charge the project ledger. */
   createHost(onTurn?: () => void): HostAdapter;
-  /** Takes the cross-process project lock. Throws GuardError "busy" or "budget". */
-  acquireProjectLock(): ProjectLock;
+  /** Takes the cross-process project lock. Rejects with GuardError "busy" or "budget". */
+  acquireProjectLock(): Promise<ProjectLock>;
 }
 
 const DEFAULT_MAX_RESPONSE_CHARS = 20_000;

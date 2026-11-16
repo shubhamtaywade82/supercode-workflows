@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { execShell, runProcess, StepTimeoutError } from "../src/index.js";
+import { type GroupEvent, execShell, onGroupEvent, runProcess, StepTimeoutError } from "../src/index.js";
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -60,4 +60,19 @@ test("normal completion returns output and the exit code", async () => {
 test("output past maxBuffer stops the run and reports overflow", async () => {
   const out = await runProcess("sh", ["-c", "yes | head -c 200000"], { maxBuffer: 10_000 });
   assert.equal(out.overflow, true);
+});
+
+test("group events report a start (with the leader's start time on Linux) and an end once the group is empty", async () => {
+  const events: GroupEvent[] = [];
+  const off = onGroupEvent((e) => events.push(e));
+  try {
+    await runProcess("sh", ["-c", "true"]);
+  } finally {
+    off();
+  }
+  assert.equal(events[0].type, "start");
+  assert.equal(events[events.length - 1].type, "end");
+  const start = events[0];
+  if (start.type === "start" && process.platform === "linux") assert.equal(typeof start.leaderStart, "number");
+  assert.equal(events[events.length - 1].type === "end" && events[events.length - 1].pgid, start.type === "start" && start.pgid);
 });

@@ -88,11 +88,18 @@ export async function runWorkflow(rt: Runtime, input: RunInput): Promise<RunResu
     );
   }
 
+  // Windows cannot end an agent's process tree, so an abort could not be guaranteed. Refuse rather than degrade.
+  if (preview.sideEffects && process.platform === "win32") {
+    throw new ToolError(
+      "side-effecting runs are refused on Windows: an aborted agent's process tree cannot be ended there, so no stop can be guaranteed",
+    );
+  }
+
   // Order: in-process slot, then the project lock (shared across processes), then the token. Every refusal before
   // the token check leaves the token unspent, so a busy or exhausted project never burns a confirmation.
   const releaseSlot = rt.guard.acquire();
   try {
-    const lock = rt.acquireProjectLock();
+    const lock = await rt.acquireProjectLock();
     try {
       if (preview.sideEffects && !rt.tokens.consume(binding, input.confirm_token ?? "")) {
         throw new ToolError(

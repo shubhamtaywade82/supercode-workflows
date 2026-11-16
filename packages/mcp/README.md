@@ -34,9 +34,10 @@ Every `workflow_run` passes these checks, in this order. A refusal at any step l
 ### How the project lock behaves
 
 - **Atomic claim.** A claim is written to a temp file and hard-linked into place, so readers never see a partial record. This needs a filesystem with hard links.
-- **Live holders are never reclaimed.** A lock held by a live process on this host stays held, however old its record is. A run's length is not bounded by the deadline, so age cannot prove the holder is gone. The cost: a reused PID blocks until that process exits or the file is removed. That fails closed.
+- **Holder identity is PID plus start time (Linux).** A reused PID has a different start time, so a dead holder is recognised and its lock is reclaimed. A live holder is never reclaimed by age, because a run's length is not bounded by its deadline.
+- **Agent groups are recorded, and cleared before reclaim.** Each agent process group is written into the lock as it starts, and removed as it ends. Before a dead holder's lock is reclaimed, its recorded groups are ended, but only where ownership can be proven. A group that cannot be proven or ended blocks the new run, and the error names the group ids. An orphaned agent therefore cannot run alongside a second run.
 - **Dead holders are reclaimed.** A lock whose holder PID is gone, on this host, is reclaimed at once.
-- **Other hosts.** A lock from another host is reclaimed only after 2 hours (`staleRemoteMs`), since its PID means nothing here.
+- **Other hosts.** A lock from another host is reclaimed only after 2 hours (`staleRemoteMs`), and never while it records agent groups, since those cannot be checked from here. An unreadable lock record always blocks. Check that no run is active, then delete it.
 - **Released on exit and on signal.** The lock is released on normal exit, and on SIGINT, SIGTERM, or SIGHUP. The process then re-raises the signal, so it still dies by it.
 - **Unreadable ledger fails closed.** It is treated as exhausted, never reset. Delete the file on purpose to reset the budget.
 
@@ -70,7 +71,7 @@ Nothing changes without `--apply`. Codex config is never written automatically. 
 
 ## Known gaps
 
-1. **Process-group guarantees are POSIX-only.** On Linux and macOS, an aborted or timed-out agent turn ends its whole process group before the step fails. On Windows, only the direct child is ended. Grandchildren may survive. A `taskkill /T` path is not implemented or tested.
+1. **Process-group guarantees are POSIX-only, and not absolute.** On Linux and macOS, an aborted or timed-out agent turn ends its whole process group before the step fails. A descendant that calls `setsid` or `setpgid` leaves the group and is not ended. On Windows, side-effecting runs are refused, because no process-tree stop is implemented there.
 2. **Nesting isolation is best-effort.** The depth token works only if the child CLI passes its environment to MCP servers it starts, and only if that child loads a supercode server at all. The project lock independently refuses a nested run while the parent holds it, so the failure mode is `busy`, not a second run. The stronger fix excludes the supercode server from leaf sub-turns with the CLI's MCP-config isolation flags, passed through `extraArgs`, once verified.
 3. **Lock residuals.** Reclaiming a stale lock is rename-then-verify. A fresh claim landing in the instant between verify and restore can leave two processes briefly holding the lock. That needs a crash and a simultaneous start on the same stale file. It is documented in `src/lock.ts`, not eliminated.
 4. **The run deadline is checked between steps only.** A long single turn runs until its own timeout (5 minutes by default). A run can therefore exceed `--deadline-ms` by up to one turn.

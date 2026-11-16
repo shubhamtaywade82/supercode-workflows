@@ -6,7 +6,7 @@ import path from "node:path";
 import type { ExecFn } from "@nemesis-oss/supercode-workflows";
 import { GuardError } from "../src/guard.js";
 import type { Runtime } from "../src/runtime.js";
-import { previewRun, runWorkflow } from "../src/tools.js";
+import { previewRun, runWorkflow, ToolError } from "../src/tools.js";
 import { claudeOk, makeProject, makeRuntime } from "./helpers.js";
 
 const okExec: ExecFn = async () => ({ stdout: claudeOk("done") });
@@ -42,4 +42,22 @@ test("two server instances on one project share a single turn budget", async () 
   await run(a); // ledger: 1
   await run(b); // ledger: 2
   await assert.rejects(run(a), isCode("budget")); // refused at lock time, before the token is consumed
+});
+
+test("side-effecting runs are refused on Windows before any lock or token is touched", async () => {
+  const dir = await makeProject();
+  const rt = makeRuntime(dir, okExec);
+  const token = previewRun(rt, { name: "Plan", prompt: "x" }).confirm_token ?? "";
+  const original = Object.getOwnPropertyDescriptor(process, "platform");
+  Object.defineProperty(process, "platform", { value: "win32" });
+  try {
+    await assert.rejects(
+      runWorkflow(rt, { name: "Plan", prompt: "x", allow_side_effects: true, confirm_token: token }),
+      (e: unknown) => e instanceof ToolError && /Windows/.test(e.message),
+    );
+  } finally {
+    if (original) Object.defineProperty(process, "platform", original);
+  }
+  // The refusal happened before the token was consumed, so the same token still works on a supported platform.
+  assert.equal((await runWorkflow(rt, { name: "Plan", prompt: "x", allow_side_effects: true, confirm_token: token })).response, "done");
 });
