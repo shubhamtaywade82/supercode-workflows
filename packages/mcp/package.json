@@ -1,0 +1,25 @@
+{
+  "name": "@nemesis-oss/supercode-mcp",
+  "version": "0.1.0",
+  "description": "MCP server exposing the supercode workflow engine to Claude Code, Codex, and Cursor.",
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=20" },
+  "bin": { "scwf-mcp": "dist/src/cli.js" },
+  "files": ["dist/src"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "npm run build && node --test \"dist/test/*.test.js\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/node": "^2.1.2",
+    "@modelcontextprotocol/server": "^2.4.0",
+    "@nemesis-oss/supercode-workflows": "file:../..",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "^2.4.0",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
