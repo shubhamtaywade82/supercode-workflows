@@ -5,9 +5,11 @@ import type { AiClient, HostAdapter, TurnRequest, TurnResult } from "./types.js"
 const pExecFile = promisify(execFile);
 
 /** Injectable process executor — lets tests feed recorded fixtures without the real CLIs. */
-export type ExecFn = (bin: string, args: string[], opts: { cwd?: string; maxBuffer?: number }) => Promise<{ stdout: string }>;
+export type ExecFn = (bin: string, args: string[], opts: { cwd?: string; maxBuffer?: number; env?: Record<string, string> }) => Promise<{ stdout: string }>;
 const defaultExec: ExecFn = async (bin, args, opts) => {
-  const { stdout } = await pExecFile(bin, args, { cwd: opts.cwd, maxBuffer: opts.maxBuffer });
+  // Merge over the parent env: callers add variables (e.g. nesting tokens), they never replace the environment.
+  const env = opts.env ? { ...process.env, ...opts.env } : undefined;
+  const { stdout } = await pExecFile(bin, args, { cwd: opts.cwd, maxBuffer: opts.maxBuffer, env });
   return { stdout: String(stdout) };
 };
 
@@ -72,6 +74,9 @@ export class ClaudeCodeAdapter implements HostAdapter {
   constructor(private readonly opts: {
     bin?: string; cwd?: string; exec?: ExecFn;
     permissionMode?: "default" | "acceptEdits" | "bypassPermissions" | "plan";
+    env?: Record<string, string>;
+    /** Extra CLI arguments appended to every turn (e.g. isolation flags once verified against your CLI version). */
+    extraArgs?: string[];
   } = {}) { this.exec = opts.exec ?? defaultExec; }
 
   async sendTurn(req: TurnRequest): Promise<TurnResult> {
@@ -83,7 +88,8 @@ export class ClaudeCodeAdapter implements HostAdapter {
     if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
     if (this.opts.permissionMode) args.push("--permission-mode", this.opts.permissionMode);
     if (this.sessionId) args.push("--resume", this.sessionId);
-    const { stdout } = await this.exec(this.opts.bin ?? "claude", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024 });
+    if (this.opts.extraArgs) args.push(...this.opts.extraArgs);
+    const { stdout } = await this.exec(this.opts.bin ?? "claude", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024, env: this.opts.env });
     const parsed = JSON.parse(stdout) as ClaudeResult;
     if (parsed.session_id) { this.sessionId = parsed.session_id; this.sessionSystemPrompt = systemPrompt; }
     if (parsed.is_error) throw new Error(`claude turn error (${parsed.subtype ?? "unknown"}): ${parsed.result ?? ""}`);
@@ -103,6 +109,9 @@ export class CodexAdapter implements HostAdapter {
     sandbox?: "read-only" | "workspace-write" | "danger-full-access";
     /** "never" makes approval-requiring actions fail instead of blocking a headless run. */
     approval?: "on-request" | "never";
+    env?: Record<string, string>;
+    /** Extra CLI arguments inserted before the prompt (e.g. isolation flags once verified against your CLI version). */
+    extraArgs?: string[];
   } = {}) { this.exec = opts.exec ?? defaultExec; }
 
   async sendTurn(req: TurnRequest): Promise<TurnResult> {
@@ -110,10 +119,11 @@ export class CodexAdapter implements HostAdapter {
     const args = ["exec", "--json", "--skip-git-repo-check", "--sandbox", this.opts.sandbox ?? "workspace-write"];
     // Config override (source-attested; not run-verified here): headless runs must not block on approval prompts.
     args.push("-c", `approval_policy="${this.opts.approval ?? "never"}"`);
+    if (this.opts.extraArgs) args.push(...this.opts.extraArgs);
     const model = req.model ?? this.opts.model;
     if (model) args.push("-m", model);
     args.push(req.systemPrompt ? `${req.systemPrompt}\n\n${req.prompt}` : req.prompt);
-    const { stdout } = await this.exec(this.opts.bin ?? "codex", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024 });
+    const { stdout } = await this.exec(this.opts.bin ?? "codex", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024, env: this.opts.env });
     let text = "";
     for (const line of stdout.split("\n")) {
       if (!line.trim()) continue;
