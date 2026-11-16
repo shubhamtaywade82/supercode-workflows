@@ -88,36 +88,42 @@ export async function runWorkflow(rt: Runtime, input: RunInput): Promise<RunResu
     );
   }
 
-  // Slot first, token second: a busy refusal must not burn a valid token.
-  const release = rt.guard.acquire();
+  // Order: in-process slot, then the project lock (shared across processes), then the token. Every refusal before
+  // the token check leaves the token unspent, so a busy or exhausted project never burns a confirmation.
+  const releaseSlot = rt.guard.acquire();
   try {
-    if (preview.sideEffects && !rt.tokens.consume(binding, input.confirm_token ?? "")) {
-      throw new ToolError(
-        "confirm_token is missing, expired, already used, or was issued for a different workflow, prompt, or definition. Call workflow_preview again",
-      );
+    const lock = rt.acquireProjectLock();
+    try {
+      if (preview.sideEffects && !rt.tokens.consume(binding, input.confirm_token ?? "")) {
+        throw new ToolError(
+          "confirm_token is missing, expired, already used, or was issued for a different workflow, prompt, or definition. Call workflow_preview again",
+        );
+      }
+      const engine = new WorkflowEngine({
+        host: rt.createHost(() => lock.chargeTurn()),
+        registry,
+        env,
+        cwd: rt.projectDir,
+        maxDurationMs: rt.guard.opts.runDeadlineMs,
+      });
+      const started = Date.now();
+      const result = await engine.run(input.name, { prompt: input.prompt });
+      const full = result.state.response;
+      const truncated = full.length > rt.maxResponseChars;
+      return {
+        name: input.name,
+        response: truncated ? full.slice(0, rt.maxResponseChars) : full,
+        truncated,
+        response_chars: full.length,
+        steps_executed: result.stepsExecuted,
+        duration_ms: Date.now() - started,
+        agent_turns_remaining: rt.guard.turnsRemaining,
+      };
+    } finally {
+      lock.release();
     }
-    const engine = new WorkflowEngine({
-      host: rt.createHost(),
-      registry,
-      env,
-      cwd: rt.projectDir,
-      maxDurationMs: rt.guard.opts.runDeadlineMs,
-    });
-    const started = Date.now();
-    const result = await engine.run(input.name, { prompt: input.prompt });
-    const full = result.state.response;
-    const truncated = full.length > rt.maxResponseChars;
-    return {
-      name: input.name,
-      response: truncated ? full.slice(0, rt.maxResponseChars) : full,
-      truncated,
-      response_chars: full.length,
-      steps_executed: result.stepsExecuted,
-      duration_ms: Date.now() - started,
-      agent_turns_remaining: rt.guard.turnsRemaining,
-    };
   } finally {
-    release();
+    releaseSlot();
   }
 }
 

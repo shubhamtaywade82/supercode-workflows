@@ -2,7 +2,7 @@
 
 An MCP server that exposes the supercode workflow engine to Claude Code, Codex, and Cursor. It is built on `@modelcontextprotocol/server` v2 (spec 2026-07-28), and reuses `@nemesis-oss/supercode-workflows` for execution.
 
-**Status 0.1.0.** `npm test` runs 42 tests, including an end-to-end run that spawns the built server over stdio. Nothing has been run against an installed Claude Code or Codex client yet. See *Known gaps* before relying on this.
+**Status 0.1.0.** `npm test` runs 54 tests: guard, tokens, preview, context, host, tools, the cross-process lock, the in-memory protocol, a real stdio end-to-end run, and the HTTP access gate. Nothing has been run against an installed Claude Code or Codex client yet. See *Known gaps* before relying on this.
 
 ## Tools
 
@@ -19,11 +19,26 @@ The host never chooses which CLI runs the agent turns. That is set at registrati
 
 ## Run guard
 
-- **Single-flight.** One workflow run at a time per server process. A second call fails fast with `busy`.
-- **Agent-turn budget.** 50 turns per process by default (`--max-turns`). A child server inherits the parent's remaining budget through `SCWF_MCP_TURN_BUDGET`.
-- **Wall-clock budget.** 15 minutes per run by default (`--deadline-ms`), passed to the engine as `maxDurationMs`.
-- **Nesting cap.** A server started with `SCWF_MCP_DEPTH >= 1` refuses `workflow_run`. The leaf CLI receives `SCWF_MCP_DEPTH = depth + 1` in its environment.
-- **Output cap.** Responses are truncated at 20,000 characters, and the response reports the original length (`--max-response-chars`).
+Every `workflow_run` passes these checks, in this order. A refusal at any step leaves the confirmation token unspent.
+
+1. **In-process slot.** One run at a time per server process. A second call fails fast with `busy`.
+2. **Project lock.** One run at a time per *project*, across every server process. Lock file: `<project>/.supercode/run/mcp.lock`. A second session on the same project is refused with `busy`. A nested run started by a child CLI is refused too, because the parent holds the lock.
+3. **Project turn ledger.** 200 agent turns per project per 24 hours by default, shared by every server on the project. Ledger: `<project>/.supercode/run/ledger.json`. When it is spent, runs are refused with `budget` before a token is consumed.
+4. **Per-process turn budget.** 50 turns by default (`--max-turns`). A child server inherits the parent's remaining budget through `SCWF_MCP_TURN_BUDGET`.
+5. **Wall-clock budget.** 15 minutes per run by default (`--deadline-ms`), passed to the engine as `maxDurationMs`. The engine checks it between steps only; see gap 4.
+6. **Nesting cap.** A server started with `SCWF_MCP_DEPTH >= 1` refuses `workflow_run`. The leaf CLI receives `SCWF_MCP_DEPTH = depth + 1`.
+7. **Output cap.** Responses are truncated at 20,000 characters, and the response reports the original length (`--max-response-chars`).
+
+`.supercode/run/` contains its own `.gitignore`, so runtime state stays out of git.
+
+### How the project lock behaves
+
+- **Atomic claim.** A claim is written to a temp file and hard-linked into place, so readers never see a partial record. This needs a filesystem with hard links.
+- **Live holders are never reclaimed.** A lock held by a live process on this host stays held, however old its record is. A run's length is not bounded by the deadline, so age cannot prove the holder is gone. The cost: a reused PID blocks until that process exits or the file is removed. That fails closed.
+- **Dead holders are reclaimed.** A lock whose holder PID is gone, on this host, is reclaimed at once.
+- **Other hosts.** A lock from another host is reclaimed only after 2 hours (`staleRemoteMs`), since its PID means nothing here.
+- **Released on exit and on signal.** The lock is released on normal exit, and on SIGINT, SIGTERM, or SIGHUP. The process then re-raises the signal, so it still dies by it.
+- **Unreadable ledger fails closed.** It is treated as exhausted, never reset. Delete the file on purpose to reset the budget.
 
 ## Confirmation
 
@@ -55,12 +70,12 @@ Nothing changes without `--apply`. Codex config is never written automatically. 
 
 ## Known gaps
 
-1. **Single-flight and budgets are per process, not global.** Two host sessions run two server processes, which means two budgets and possibly two concurrent runs. A lock file in the project directory would enforce one run at a time across processes. It is not implemented.
-2. **Nesting depends on two things I could not verify here.** The child CLI must pass the environment through to any MCP server it starts, and that child must load a supercode server at all. The stronger fix is to exclude the supercode server from leaf sub-turns with the CLI's MCP-config isolation flags, passed through `extraArgs` once confirmed.
-3. **Timeouts do not stop agent processes.** The engine's per-turn timeout rejects the promise, but the spawned CLI keeps running. Stopping it needs an `AbortSignal` passed from `HostAdapter.sendTurn` into `execFile`. Not implemented. This is the most important fix before unattended use.
-4. **The run deadline is checked between steps only.** A long single turn runs until its own timeout (5 minutes by default).
-5. **Headless permissions.** Codex runs with `approval_policy="never"` and `workspace-write` by default. Claude uses its own default permission mode unless `--permission-mode` is given. In headless mode the default may deny edits.
-6. **Clients not yet tested.** The protocol path is covered by in-memory and stdio tests. Claude Code and Codex have not been used as clients.
+1. **Process-group guarantees are POSIX-only.** On Linux and macOS, an aborted or timed-out agent turn ends its whole process group before the step fails. On Windows, only the direct child is ended. Grandchildren may survive. A `taskkill /T` path is not implemented or tested.
+2. **Nesting isolation is best-effort.** The depth token works only if the child CLI passes its environment to MCP servers it starts, and only if that child loads a supercode server at all. The project lock independently refuses a nested run while the parent holds it, so the failure mode is `busy`, not a second run. The stronger fix excludes the supercode server from leaf sub-turns with the CLI's MCP-config isolation flags, passed through `extraArgs`, once verified.
+3. **Lock residuals.** Reclaiming a stale lock is rename-then-verify. A fresh claim landing in the instant between verify and restore can leave two processes briefly holding the lock. That needs a crash and a simultaneous start on the same stale file. It is documented in `src/lock.ts`, not eliminated.
+4. **The run deadline is checked between steps only.** A long single turn runs until its own timeout (5 minutes by default). A run can therefore exceed `--deadline-ms` by up to one turn.
+5. **Headless permissions are a precondition for autonomous runs.** Codex runs with `approval_policy="never"` and `workspace-write` by default. Claude uses its own default permission mode unless `--permission-mode` is given. In headless mode that default may deny edits. Set it explicitly before running unattended.
+6. **Clients not yet tested.** The protocol path is covered by in-memory and stdio tests. Claude Code and Codex have not been used as clients, and their flag names have been checked against source only, not against installed binaries.
 
 ## Development
 

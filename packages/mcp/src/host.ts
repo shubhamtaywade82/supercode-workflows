@@ -4,6 +4,7 @@ import {
   EchoHost,
   type ExecFn,
   type HostAdapter,
+  type TurnOptions,
   type TurnRequest,
   type TurnResult,
 } from "@nemesis-oss/supercode-workflows";
@@ -18,13 +19,21 @@ export const DEPTH_ENV = "SCWF_MCP_DEPTH";
 /** Remaining agent-turn budget handed to a child CLI, so nested servers share the parent's budget. */
 export const TURN_BUDGET_ENV = "SCWF_MCP_TURN_BUDGET";
 
-/** Charges every agent turn against the process-wide guard before delegating to the real host. */
+/**
+ * Charges every agent turn before delegating: first to the project ledger (shared across processes), then to the
+ * in-process guard. The abort signal passes through unchanged.
+ */
 export class CountingHost implements HostAdapter {
-  constructor(private readonly inner: HostAdapter, private readonly guard: RunGuard) {}
+  constructor(
+    private readonly inner: HostAdapter,
+    private readonly guard: RunGuard,
+    private readonly onTurn?: () => void,
+  ) {}
 
-  async sendTurn(req: TurnRequest): Promise<TurnResult> {
+  async sendTurn(req: TurnRequest, opts?: TurnOptions): Promise<TurnResult> {
+    this.onTurn?.();
     this.guard.chargeTurn();
-    return this.inner.sendTurn(req);
+    return this.inner.sendTurn(req, opts);
   }
 
   resetContext(): void | Promise<void> {
@@ -48,7 +57,7 @@ export interface LeafOptions {
  * remaining turn budget in its environment. If that CLI loads a supercode MCP server, the child server sees the
  * depth, and any child at or beyond the cap refuses workflow_run.
  */
-export function createLeafHost(o: LeafOptions, guard: RunGuard): HostAdapter {
+export function createLeafHost(o: LeafOptions, guard: RunGuard, onTurn?: () => void): HostAdapter {
   const env = { [DEPTH_ENV]: String(o.depth + 1), [TURN_BUDGET_ENV]: String(guard.turnsRemaining) };
   let inner: HostAdapter;
   if (o.kind === "claude") {
@@ -58,5 +67,5 @@ export function createLeafHost(o: LeafOptions, guard: RunGuard): HostAdapter {
   } else {
     inner = new EchoHost();
   }
-  return new CountingHost(inner, guard);
+  return new CountingHost(inner, guard, onTurn);
 }

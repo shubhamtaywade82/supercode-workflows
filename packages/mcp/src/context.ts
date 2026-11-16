@@ -44,11 +44,13 @@ export async function buildContext(projectDir: string, opts: ContextOptions): Pr
   let entries = 0;
   let truncated = false;
 
+  const supercodeDir = path.join(root, ".supercode");
   const walk = async (dir: string, depth: number): Promise<void> => {
     if (depth > opts.maxDepth) return;
     const items = (await readdir(dir, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name));
     for (const item of items) {
       if (item.isSymbolicLink() || IGNORED_DIRS.has(item.name)) continue;
+      if (item.isDirectory() && item.name === "run" && dir === supercodeDir) continue; // lock and ledger, not layout
       if (entries >= opts.maxEntries) {
         truncated = true;
         return;
