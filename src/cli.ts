@@ -7,6 +7,21 @@ function flag(args: string[], name: string): string | undefined {
   return i >= 0 ? args[i + 1] : undefined;
 }
 
+function fail(message: string): never {
+  console.error(`scwf: ${message}`);
+  process.exit(1);
+}
+
+/** Absent flag -> undefined. Present but not in `allowed` -> exit. A typo must never silently fall back to a wider default. */
+function enumFlag<T extends string>(args: string[], name: string, allowed: readonly T[]): T | undefined {
+  if (!args.includes(`--${name}`)) return undefined;
+  const value = flag(args, name);
+  if (value === undefined || !(allowed as readonly string[]).includes(value)) {
+    return fail(`--${name} must be one of: ${allowed.join(", ")}`);
+  }
+  return value as T;
+}
+
 const args = process.argv.slice(2);
 const cmd = args[0];
 const { registry, env } = loadWorkflows({ projectRoot: flag(args, "dir") });
@@ -20,11 +35,18 @@ if (cmd === "list") {
   const name = args[1];
   const prompt = flag(args, "prompt");
   if (!name || prompt === undefined) {
-    console.error("usage: scwf run <name> --prompt <text> [--host echo|claude|codex] [--ai ollama|openai] [--model m] [--mode m] [--dir path] [--json-events]");
+    console.error("usage: scwf run <name> --prompt <text> [--host echo|claude|codex] [--sandbox read-only|workspace-write|danger-full-access] [--permission-mode default|acceptEdits|bypassPermissions|plan] [--ai ollama|openai] [--model m] [--mode m] [--dir path] [--json-events]");
     process.exit(1);
   }
   const hostKind = flag(args, "host") ?? "echo";
-  const host: HostAdapter = hostKind === "claude" ? new ClaudeCodeAdapter() : hostKind === "codex" ? new CodexAdapter() : new EchoHost();
+  const sandbox = enumFlag(args, "sandbox", ["read-only", "workspace-write", "danger-full-access"] as const);
+  const permissionMode = enumFlag(args, "permission-mode", ["default", "acceptEdits", "bypassPermissions", "plan"] as const);
+  if (sandbox && hostKind !== "codex") fail("--sandbox applies only to --host codex");
+  if (permissionMode && hostKind !== "claude") fail("--permission-mode applies only to --host claude");
+  const host: HostAdapter =
+    hostKind === "claude" ? new ClaudeCodeAdapter({ permissionMode }) :
+    hostKind === "codex" ? new CodexAdapter({ sandbox }) :
+    new EchoHost();
   const aiKind = flag(args, "ai");
   const ai: AiClient | undefined =
     aiKind === "ollama" ? new OllamaAi({ model: flag(args, "ollama-model") }) :

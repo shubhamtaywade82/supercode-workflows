@@ -11,7 +11,7 @@ A deterministic, host-agnostic workflow executor for AI coding agents. Steps run
 
 ## Status: 0.1.0
 
-- Verified by the test suite (`npm test`, 19 `node:test` behavioral tests): engine semantics, updaters, conditions, budgets, loader, confirm gate, URL/AI updaters against local test servers and mocks, and Claude Code / Codex adapter parsing against recorded event fixtures.
+- Verified by the test suite (`npm test`, 21 `node:test` behavioral tests): engine semantics, updaters, conditions, budgets, loader, confirm gate, URL/AI updaters against local test servers and mocks, and Claude Code / Codex adapter parsing against recorded event fixtures.
 - Not verified against live services: the adapter tests use recorded fixtures, not installed CLIs. CLI flag names (`--sandbox`, `--permission-mode`) and authentication have not been checked against specific CLI releases. The Ollama and OpenAI-compatible clients are not exercised by tests.
 
 ## Usage
@@ -24,6 +24,9 @@ npx scwf run "Plan Then Build" --prompt "add rate limiting" --host echo --dir ./
 ```
 
 Hosts: `--host echo` (no agent, for dry runs), `--host claude`, `--host codex`.
+Sandbox: `--sandbox read-only|workspace-write|danger-full-access` applies only to `--host codex`.
+Permissions: `--permission-mode default|acceptEdits|bypassPermissions|plan` applies only to `--host claude`.
+Invalid values, or a flag used with the wrong host, exit with an error rather than falling back to a default.
 AI steps: `--ai ollama --ollama-model <model>` or `--ai openai` (reads `OPENAI_BASE_URL` / `OPENAI_API_KEY`).
 
 ## Workflow files
@@ -51,7 +54,9 @@ Variables: `$prompt`, `$systemPrompt`, `$response`, `$packedResponses`, `$model`
 
 - Workflows are trusted code, as in any agent-automation system. Review workflow files before running them.
 - `shell` steps run under `/bin/bash` with your privileges.
-- `--host codex` runs `codex exec` with `--sandbox workspace-write` by default, so agent steps can edit files in the project. `--host claude` uses the CLI's own permission mode unless `permissionMode` is set in the adapter options. Run autonomous workflows in an isolated checkout or runner.
+- `--host codex` runs `codex exec` with `--sandbox workspace-write` and `approval_policy="never"` by default. Agent steps can edit files in the project, and actions that would need an approval prompt fail instead of blocking the run. The sandbox and approval flags were checked against the Codex source, not against a live run.
+- `--host claude` uses the CLI's own permission mode unless `--permission-mode` is given. Run autonomous workflows in an isolated checkout or runner.
+- Claude captures `--append-system-prompt` on a session's first request. `ClaudeCodeAdapter` starts a new session whenever a step's system prompt differs from the current session's, so per-step `systemPrompt` values take effect. The cost is that Claude's internal conversation memory resets at that point. Cross-step context is carried by `$packedResponses`.
 - `js` snippets run in `node:vm` with a timeout. `vm` is not a security boundary.
 - `url` updaters and conditions send the current prompt and response to the URL you configure.
 - Steps marked `requireConfirm` are denied unless a `confirm` callback approves them.

@@ -19,6 +19,15 @@ test("CodexAdapter takes the last agent_message, ignores reasoning, passes flags
   assert.ok(calls[0].includes("--json") && calls[0].includes("--skip-git-repo-check"));
   assert.ok(calls[0].includes("--sandbox") && calls[0].includes("workspace-write"));
   assert.ok(calls[0].includes("-m") && calls[0].includes("gpt-5-codex"));
+  assert.ok(calls[0].includes("-c") && calls[0].includes('approval_policy="never"'));
+});
+
+test("CodexAdapter approval option overrides the never default", async () => {
+  const calls: string[][] = [];
+  const adapter = new CodexAdapter({ approval: "on-request", exec: async (_bin, args) => { calls.push(args); return { stdout: codexFixture }; } });
+  await adapter.sendTurn({ prompt: "x" });
+  assert.ok(calls[0].includes('approval_policy="on-request"'));
+  assert.ok(!calls[0].includes('approval_policy="never"'));
 });
 
 test("CodexAdapter throws on turn.failed", async () => {
@@ -39,11 +48,26 @@ test("ClaudeCodeAdapter parses result, resumes by session_id, resets cleanly", a
   const adapter = new ClaudeCodeAdapter({ exec: async (_bin, args) => { calls.push(args); return { stdout: claudeFixture }; } });
   assert.equal((await adapter.sendTurn({ prompt: "first", systemPrompt: "sys", model: "sonnet" })).text, "claude final");
   assert.ok(calls[0].includes("--append-system-prompt") && calls[0].includes("--model"));
-  await adapter.sendTurn({ prompt: "second" });
+  await adapter.sendTurn({ prompt: "second", systemPrompt: "sys" });
   assert.ok(calls[1].includes("--resume") && calls[1].includes("sess-123"));
   adapter.resetContext();
   await adapter.sendTurn({ prompt: "third" });
   assert.ok(!calls[2].includes("--resume"));
+});
+
+test("ClaudeCodeAdapter starts a new session when the system prompt changes", async () => {
+  const calls: string[][] = [];
+  let n = 0;
+  const adapter = new ClaudeCodeAdapter({ exec: async (_bin, args) => {
+    calls.push(args); n++;
+    return { stdout: JSON.stringify({ is_error: false, result: `r${n}`, session_id: `s${n}` }) };
+  } });
+  await adapter.sendTurn({ prompt: "a", systemPrompt: "A" });   // session s1
+  await adapter.sendTurn({ prompt: "b", systemPrompt: "A" });   // same prompt: resume s1
+  await adapter.sendTurn({ prompt: "c", systemPrompt: "B" });   // changed prompt: fresh session
+  assert.ok(calls[1].includes("--resume") && calls[1].includes("s1"));
+  assert.ok(!calls[2].includes("--resume"));
+  assert.ok(calls[2].includes("--append-system-prompt") && calls[2].includes("B"));
 });
 
 test("ClaudeCodeAdapter throws on is_error", async () => {

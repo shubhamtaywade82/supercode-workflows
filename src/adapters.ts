@@ -66,6 +66,8 @@ interface ClaudeResult { result?: string; session_id?: string; is_error?: boolea
 /** Claude Code headless adapter (`claude -p --output-format json`). Requires the claude CLI. */
 export class ClaudeCodeAdapter implements HostAdapter {
   private sessionId?: string;
+  /** System prompt the current session was created with. Claude snapshots --append-system-prompt on a session's first request. */
+  private sessionSystemPrompt = "";
   private readonly exec: ExecFn;
   constructor(private readonly opts: {
     bin?: string; cwd?: string; exec?: ExecFn;
@@ -73,14 +75,17 @@ export class ClaudeCodeAdapter implements HostAdapter {
   } = {}) { this.exec = opts.exec ?? defaultExec; }
 
   async sendTurn(req: TurnRequest): Promise<TurnResult> {
+    const systemPrompt = req.systemPrompt ?? "";
+    // A changed system prompt only applies in a new session, so start one rather than silently resuming the old snapshot.
+    if (this.sessionId && systemPrompt !== this.sessionSystemPrompt) this.sessionId = undefined;
     const args = ["-p", req.prompt, "--output-format", "json"];
     if (req.model) args.push("--model", req.model);
-    if (req.systemPrompt) args.push("--append-system-prompt", req.systemPrompt);
+    if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
     if (this.opts.permissionMode) args.push("--permission-mode", this.opts.permissionMode);
     if (this.sessionId) args.push("--resume", this.sessionId);
     const { stdout } = await this.exec(this.opts.bin ?? "claude", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024 });
     const parsed = JSON.parse(stdout) as ClaudeResult;
-    if (parsed.session_id) this.sessionId = parsed.session_id;
+    if (parsed.session_id) { this.sessionId = parsed.session_id; this.sessionSystemPrompt = systemPrompt; }
     if (parsed.is_error) throw new Error(`claude turn error (${parsed.subtype ?? "unknown"}): ${parsed.result ?? ""}`);
     const text = parsed.result ?? "";
     return { text, messages: [{ role: "assistant", content: text }] };
@@ -96,11 +101,15 @@ export class CodexAdapter implements HostAdapter {
   constructor(private readonly opts: {
     bin?: string; cwd?: string; exec?: ExecFn; model?: string;
     sandbox?: "read-only" | "workspace-write" | "danger-full-access";
+    /** "never" makes approval-requiring actions fail instead of blocking a headless run. */
+    approval?: "on-request" | "never";
   } = {}) { this.exec = opts.exec ?? defaultExec; }
 
   async sendTurn(req: TurnRequest): Promise<TurnResult> {
     // Default workspace-write so implementation steps can edit files; read-only for review-only workflows.
     const args = ["exec", "--json", "--skip-git-repo-check", "--sandbox", this.opts.sandbox ?? "workspace-write"];
+    // Config override (source-attested; not run-verified here): headless runs must not block on approval prompts.
+    args.push("-c", `approval_policy="${this.opts.approval ?? "never"}"`);
     const model = req.model ?? this.opts.model;
     if (model) args.push("-m", model);
     args.push(req.systemPrompt ? `${req.systemPrompt}\n\n${req.prompt}` : req.prompt);
