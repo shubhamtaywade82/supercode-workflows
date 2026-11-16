@@ -8,6 +8,7 @@ const KILL_GRACE_MS = 2_000;
 /** How long stdio may stay open after the leader exits, before we stop waiting for it. */
 const CLOSE_GRACE_MS = 1_000;
 const DEFAULT_MAX_BUFFER = 64 * 1024 * 1024;
+/** Stderr kept for diagnostics, counted in UTF-16 code units (characters), not bytes. Earlier output is dropped; see stderrTruncated. */
 const STDERR_KEEP = 64 * 1024;
 
 /** Process groups with a child still in them. Killed on exit, on SIGINT/SIGTERM/SIGHUP, and by killLiveGroupsNow(). */
@@ -211,6 +212,8 @@ export interface RunOutcome {
   aborted: boolean;
   timedOut: boolean;
   overflow: boolean;
+  /** True when stderr was longer than the kept window, so its beginning is missing. Its absence there cannot be proven. */
+  stderrTruncated: boolean;
 }
 
 /**
@@ -234,7 +237,7 @@ export interface RunOutcome {
  */
 export function runProcess(bin: string, args: string[], opts: RunOptions = {}): Promise<RunOutcome> {
   if (opts.signal?.aborted) {
-    return Promise.resolve({ code: null, stdout: "", stderr: "", aborted: true, timedOut: false, overflow: false });
+    return Promise.resolve({ code: null, stdout: "", stderr: "", aborted: true, timedOut: false, overflow: false, stderrTruncated: false });
   }
   installHooks();
   return new Promise<RunOutcome>((resolve, reject) => {
@@ -258,6 +261,12 @@ export function runProcess(bin: string, args: string[], opts: RunOptions = {}): 
     let settled = false;  // the promise has settled
     let stdout = "";
     let stderr = "";
+    let stderrTruncated = false; // set once any stderr has been dropped from the kept window
+    const appendStderr = (text: string): void => {
+      const joined = stderr + text;
+      if (joined.length > STDERR_KEEP) stderrTruncated = true;
+      stderr = joined.slice(-STDERR_KEEP);
+    };
     const outDecoder = new StringDecoder("utf8");
     const errDecoder = new StringDecoder("utf8");
     let escalation: NodeJS.Timeout | undefined;
@@ -316,7 +325,7 @@ export function runProcess(bin: string, args: string[], opts: RunOptions = {}): 
       }
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr = (stderr + errDecoder.write(chunk)).slice(-STDERR_KEEP);
+      appendStderr(errDecoder.write(chunk));
     });
     const closed = new Promise<void>((done) => child.once("close", () => done()));
 
@@ -348,7 +357,7 @@ export function runProcess(bin: string, args: string[], opts: RunOptions = {}): 
         const empty = pgid === undefined ? true : await terminateGroup(pgid);
         await Promise.race([closed, sleep(CLOSE_GRACE_MS)]);
         stdout += outDecoder.end();
-        stderr = (stderr + errDecoder.end()).slice(-STDERR_KEEP);
+        appendStderr(errDecoder.end());
         if (pgid !== undefined && empty) {
           LIVE_GROUPS.delete(pgid); // a group that survived stays tracked, so shutdown still kills it
           try {
@@ -360,7 +369,7 @@ export function runProcess(bin: string, args: string[], opts: RunOptions = {}): 
         settle(() => {
           if (failure) reject(failure);
           else if (!empty) reject(new Error(`process group ${pgid} survived SIGKILL; ${bin} may still be writing to the project`));
-          else resolve({ code, stdout, stderr, aborted, timedOut, overflow });
+          else resolve({ code, stdout, stderr, aborted, timedOut, overflow, stderrTruncated });
         });
       })().catch((e: unknown) => settle(() => reject(e instanceof Error ? e : new Error(String(e)))));
     });

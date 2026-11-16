@@ -19,7 +19,12 @@ async function plant(dir: string, record: Record<string, unknown>): Promise<void
   await writeFile(lockFile(dir), JSON.stringify(record));
 }
 
+/**
+ * Resolves once the child has exited. If it already has, resolves at once: `exit` is not replayed to a listener added late.
+ * A group the code under test ended can be reaped before the test reaches its `finally`, so a bare `once("exit")` can hang.
+ */
 function exited(child: ChildProcess): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
   return new Promise((resolve) => child.once("exit", () => resolve()));
 }
 

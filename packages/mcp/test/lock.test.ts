@@ -25,7 +25,11 @@ async function plant(dir: string, record: Record<string, unknown>): Promise<void
   await writeFile(lockFile(dir), JSON.stringify(record));
 }
 
+/** Resolves at exit. If the child has already exited, resolves at once: `exit` is not replayed to a late listener. */
 function exited(child: ChildProcess): Promise<{ code: number | null; signal: NodeJS.Signals | null }> {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+  }
   return new Promise((resolve) => child.once("exit", (code, signal) => resolve({ code, signal })));
 }
 

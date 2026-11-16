@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { MockHost, RtkAdapter, RtkError, WorkflowEngine } from "../src/index.js";
+import { MockHost, RtkAdapter, RtkError, WorkflowEngine, onGroupEvent } from "../src/index.js";
 import type { ConfirmPreview, Registry, RtkErrorKind, Step, Workflow } from "../src/index.js";
 
 // These tests use a stub rtk, a shell script that stands in for the binary. They exercise the real spawn path, exit codes
@@ -18,6 +18,10 @@ interface StubSpec {
   rewriteOut: string;
   /** Stderr of `rtk rewrite`, verbatim. */
   rewriteErr?: string;
+  /** Print the output, then sleep this many seconds with SIGTERM set to exit 0. Used to test a run stopped by timeout. */
+  rewriteDelaySec?: number;
+  /** Kill the rewrite process with SIGKILL, so it ends by signal and has no exit code. */
+  killSelf?: boolean;
 }
 
 interface Stub { bin: string; log: string; command: string }
@@ -34,12 +38,15 @@ function stubRtk(spec: StubSpec): Stub {
   writeFileSync(out, spec.rewriteOut);
   const err = path.join(dir, "rewrite.err");
   writeFileSync(err, spec.rewriteErr ?? "");
+  const tail = spec.rewriteDelaySec
+    ? `cat '${out}'; trap 'exit 0' TERM; sleep ${spec.rewriteDelaySec}; exit 0`
+    : `cat '${out}'; cat '${err}' >&2; exit ${spec.rewriteExit}`;
   const bin = path.join(dir, "rtk");
   writeFileSync(bin, [
     "#!/bin/sh",
     "case \"$1\" in",
     `  --version) printf 'version telemetry=%s\\n' "$RTK_TELEMETRY_DISABLED" >> '${log}'; echo "rtk stub"; exit ${spec.version ?? 0} ;;`,
-    `  rewrite) printf 'rewrite argc=%s telemetry=%s\\n' "$#" "$RTK_TELEMETRY_DISABLED" >> '${log}'; printf '%s' "$2" > '${command}'; cat '${out}'; cat '${err}' >&2; exit ${spec.rewriteExit} ;;`,
+    `  rewrite) printf 'rewrite argc=%s telemetry=%s\\n' "$#" "$RTK_TELEMETRY_DISABLED" >> '${log}'; printf '%s' "$2" > '${command}'; ${spec.killSelf ? "kill -9 $$; " : ""}${tail} ;;`,
     `  *) printf 'unexpected argv=%s\\n' "$*" >> '${log}'; exit 98 ;;`,
     "esac",
     "",
@@ -202,6 +209,46 @@ test("rtk: true with no adapter configured fails closed, and the command does no
 test("rtk on a non-shell step is a configuration error, and nothing runs", async () => {
   const e = shellEngine([{ name: "p", prompt: "hi", rtk: true }], new RtkAdapter({ bin: "/nonexistent/rtk-bin" }));
   await assert.rejects(e.run("W", { prompt: "P" }), /rtk applies only to shell steps/);
+});
+
+test("exit 1 with only whitespace on stdout passes the original through", async () => {
+  const stub = stubRtk({ rewriteExit: 1, rewriteOut: "\n" });
+  assert.equal(await new RtkAdapter({ bin: stub.bin }).prepare("echo a"), "echo a");
+});
+
+test("exit 1 whose stderr overflows the kept window is refused, even when the marker was in the lost part", async () => {
+  const original = path.join(workDir(), "original");
+  const stub = stubRtk({ rewriteExit: 1, rewriteOut: "", rewriteErr: `hook integrity check FAILED\n${"x".repeat(70_000)}` });
+  const e = shellEngine([{ name: "s", shell: `touch ${original}`, rtk: true }], new RtkAdapter({ bin: stub.bin }));
+  await assert.rejects(e.run("W", { prompt: "P" }), isRtkError("integrity"));
+  assert.equal(existsSync(original), false, "the original command must not run");
+});
+
+test("a rewrite that outlives its timeout is refused, even when it then exits 0", async () => {
+  const stub = stubRtk({ rewriteExit: 0, rewriteOut: "printf LATE", rewriteDelaySec: 5 });
+  await assert.rejects(new RtkAdapter({ bin: stub.bin, timeoutMs: 300 }).prepare("echo a"), isRtkError("timeout"));
+});
+
+test("a rewrite killed by a signal is refused as a failed process, not read as an exit code", async () => {
+  const stub = stubRtk({ rewriteExit: 1, rewriteOut: "", killSelf: true });
+  await assert.rejects(new RtkAdapter({ bin: stub.bin }).prepare("echo a"), isRtkError("process-failed"));
+});
+
+test("a rewrite whose stdout exceeds the adapter's buffer is refused as overflow, and never used", async () => {
+  const stub = stubRtk({ rewriteExit: 0, rewriteOut: "x".repeat(5_000) });
+  await assert.rejects(new RtkAdapter({ bin: stub.bin, maxBuffer: 1_000 }).prepare("echo a"), isRtkError("overflow"));
+});
+
+test("a failure in a group listener is reported as process-failed, not as unavailable", async () => {
+  // The project lock records agent groups through this listener. When it refuses, the run is stopped. rtk is present, so the
+  // failure must not be reported as "unavailable".
+  const stub = stubRtk({ rewriteExit: 1, rewriteOut: "" });
+  const off = onGroupEvent((ev) => { if (ev.type === "start") throw new Error("lock refused the group"); });
+  try {
+    await assert.rejects(new RtkAdapter({ bin: stub.bin }).prepare("echo a"), isRtkError("process-failed"));
+  } finally {
+    off();
+  }
 });
 
 test("a shell step without rtk runs unwrapped, and needs no adapter", async () => {
