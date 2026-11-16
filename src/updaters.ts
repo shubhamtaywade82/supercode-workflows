@@ -30,8 +30,8 @@ export function execShell(command: string, opts: { env: Record<string, string>; 
     const child = spawn(command, { shell: "/bin/bash", cwd: opts.cwd, env: { ...process.env, ...opts.env } });
     const timer = setTimeout(() => child.kill("SIGKILL"), opts.timeoutMs);
     let stdout = "", stderr = "";
-    child.stdout.on("data", d => { stdout += String(d); });
-    child.stderr.on("data", d => { stderr += String(d); });
+    child.stdout?.on("data", d => { stdout += String(d); });
+    child.stderr?.on("data", d => { stderr += String(d); });
     child.on("error", e => { clearTimeout(timer); reject(e); });
     child.on("close", (code, signal) => {
       clearTimeout(timer);
