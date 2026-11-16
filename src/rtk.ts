@@ -26,7 +26,9 @@ import { runProcess, type RunOutcome } from "./proc.js";
 
 export type RtkErrorKind =
   | "unavailable"   // rtk could not be started at all (ENOENT, EACCES)
-  | "ask" | "denied" | "unexpected" | "rewrite-failed" | "integrity"
+  | "ask" | "denied" | "unexpected" | "rewrite-failed"
+  | "dispatch-refused" // rtk's fallback dispatcher reported an integrity failure and never reached the tool
+  | "unverified"       // exit 1 with stderr truncated: the integrity marker cannot be ruled out, so the command is refused
   | "timeout"       // the run hit its deadline; its output is not trusted, even if it then exited 0
   | "overflow"      // stdout exceeded the adapter's buffer limit
   | "process-failed"; // the process started but did not finish cleanly: killed by a signal, group not ended, or a listener failed
@@ -136,10 +138,10 @@ export class RtkAdapter {
         // original through on the second reading would bypass that refusal. runProcess keeps only the last 64 Ki characters of
         // stderr, so when stderr was truncated the marker may have been lost, and its absence cannot be proven.
         if (out.stderrTruncated) {
-          throw new RtkError("integrity", "rtk wrote more stderr than the adapter keeps on exit 1, so its integrity marker cannot be ruled out; the command was not run");
+          throw new RtkError("unverified", "rtk exited 1 and wrote more stderr than the adapter keeps, so its integrity marker cannot be ruled out; the command was not run");
         }
         if (out.stderr.includes(INTEGRITY_MARKER)) {
-          throw new RtkError("integrity", "rtk refused: its integrity check failed and the tool was not reached; the command was not run");
+          throw new RtkError("dispatch-refused", "rtk refused to dispatch: its integrity check failed, so the tool was never reached; the command was not run");
         }
         // The pinned contract is (1, ""). Whitespace carries no rewrite, so a trailing newline is tolerated. Anything else is anomalous.
         if (out.stdout.trim() !== "") {

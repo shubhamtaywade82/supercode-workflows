@@ -141,7 +141,7 @@ test("exit 1 with rtk's integrity-check marker is refused, and the original does
   const original = path.join(workDir(), "original");
   const stub = stubRtk({ rewriteExit: 1, rewriteOut: "", rewriteErr: "hook integrity check FAILED: tool not reached\n" });
   const e = shellEngine([{ name: "s", shell: `touch ${original}`, rtk: true }], new RtkAdapter({ bin: stub.bin }));
-  await assert.rejects(e.run("W", { prompt: "P" }), isRtkError("integrity"));
+  await assert.rejects(e.run("W", { prompt: "P" }), isRtkError("dispatch-refused"));
   assert.equal(existsSync(original), false, "the original command must not run");
 });
 
@@ -220,7 +220,7 @@ test("exit 1 whose stderr overflows the kept window is refused, even when the ma
   const original = path.join(workDir(), "original");
   const stub = stubRtk({ rewriteExit: 1, rewriteOut: "", rewriteErr: `hook integrity check FAILED\n${"x".repeat(70_000)}` });
   const e = shellEngine([{ name: "s", shell: `touch ${original}`, rtk: true }], new RtkAdapter({ bin: stub.bin }));
-  await assert.rejects(e.run("W", { prompt: "P" }), isRtkError("integrity"));
+  await assert.rejects(e.run("W", { prompt: "P" }), isRtkError("unverified"));
   assert.equal(existsSync(original), false, "the original command must not run");
 });
 
