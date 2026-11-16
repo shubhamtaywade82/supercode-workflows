@@ -47,7 +47,12 @@ export interface WorkflowState {
 
 export interface TurnRequest { prompt: string; systemPrompt?: string; model?: string; mode?: string }
 export interface TurnResult { text: string; messages?: PackedMessage[] }
-export interface HostAdapter { sendTurn(req: TurnRequest): Promise<TurnResult>; resetContext(): Promise<void> | void }
+/**
+ * Per-turn controls. A host must end its agent process tree when `signal` aborts, and must not settle with a result
+ * after the abort. The engine does not depend on this: it bounds the wait either way.
+ */
+export interface TurnOptions { signal?: AbortSignal }
+export interface HostAdapter { sendTurn(req: TurnRequest, opts?: TurnOptions): Promise<TurnResult>; resetContext(): Promise<void> | void }
 export interface AiClient { complete(instruction: string): Promise<string> }
 
 export interface ConfirmPreview {

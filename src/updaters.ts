@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { runProcess } from "./proc.js";
 import vm from "node:vm";
 import type { AiClient, Condition, PackedMessage, Updater, WorkflowState } from "./types.js";
 
@@ -24,21 +24,13 @@ export function interpolate(s: string, state: WorkflowState, env: Record<string,
     .replace(/\$env\.([A-Za-z_][A-Za-z0-9_]*)/g, (_, k: string) => env[k] ?? "");
 }
 
-export function execShell(command: string, opts: { env: Record<string, string>; cwd?: string; timeoutMs: number }):
+/** Runs a shell command in its own process group. A timeout ends the whole group, so no orphans are left writing. */
+export async function execShell(command: string, opts: { env: Record<string, string>; cwd?: string; timeoutMs: number }):
   Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, { shell: "/bin/bash", cwd: opts.cwd, env: { ...process.env, ...opts.env } });
-    const timer = setTimeout(() => child.kill("SIGKILL"), opts.timeoutMs);
-    let stdout = "", stderr = "";
-    child.stdout?.on("data", d => { stdout += String(d); });
-    child.stderr?.on("data", d => { stderr += String(d); });
-    child.on("error", e => { clearTimeout(timer); reject(e); });
-    child.on("close", (code, signal) => {
-      clearTimeout(timer);
-      if (signal) reject(new StepTimeoutError(`shell timed out after ${opts.timeoutMs}ms: ${command}`));
-      else resolve({ code: code ?? -1, stdout, stderr });
-    });
-  });
+  const out = await runProcess("/bin/bash", ["-c", command], { cwd: opts.cwd, env: opts.env, timeoutMs: opts.timeoutMs });
+  if (out.timedOut) throw new StepTimeoutError(`shell timed out after ${opts.timeoutMs}ms: ${command}`);
+  if (out.overflow) throw new Error(`shell output exceeded the buffer: ${command}`);
+  return { code: out.code ?? -1, stdout: out.stdout, stderr: out.stderr };
 }
 
 /** Workflows are trusted code (same trust model as Supercode). vm limits runaway scripts, not malice. */

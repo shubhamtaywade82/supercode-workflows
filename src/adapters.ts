@@ -1,23 +1,28 @@
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import type { AiClient, HostAdapter, TurnRequest, TurnResult } from "./types.js";
+import type { AiClient, HostAdapter, TurnOptions, TurnRequest, TurnResult } from "./types.js";
+import { runProcess } from "./proc.js";
 
-const pExecFile = promisify(execFile);
+/**
+ * Injectable process executor: tests feed recorded fixtures without the real CLIs. An abort on `signal` must end the
+ * whole process tree before the promise settles.
+ */
+export type ExecFn = (bin: string, args: string[], opts: {
+  cwd?: string; maxBuffer?: number; env?: Record<string, string>; signal?: AbortSignal;
+}) => Promise<{ stdout: string }>;
 
-/** Injectable process executor — lets tests feed recorded fixtures without the real CLIs. */
-export type ExecFn = (bin: string, args: string[], opts: { cwd?: string; maxBuffer?: number; env?: Record<string, string> }) => Promise<{ stdout: string }>;
 const defaultExec: ExecFn = async (bin, args, opts) => {
-  // Merge over the parent env: callers add variables (e.g. nesting tokens), they never replace the environment.
-  const env = opts.env ? { ...process.env, ...opts.env } : undefined;
-  const { stdout } = await pExecFile(bin, args, { cwd: opts.cwd, maxBuffer: opts.maxBuffer, env });
-  return { stdout: String(stdout) };
+  // Merged over the parent environment: callers add variables, they never replace it.
+  const out = await runProcess(bin, args, { cwd: opts.cwd, env: opts.env, maxBuffer: opts.maxBuffer, signal: opts.signal });
+  if (out.aborted) throw new Error(`${bin} was aborted before it completed`);
+  if (out.overflow) throw new Error(`${bin} output exceeded maxBuffer`);
+  if (out.code !== 0) throw new Error(`${bin} exited with ${out.code}: ${out.stderr.slice(-4000)}`);
+  return { stdout: out.stdout };
 };
 
 export class MockHost implements HostAdapter {
   readonly turns: TurnRequest[] = [];
   resets = 0;
   constructor(private readonly responder: (req: TurnRequest) => string | Promise<string>) {}
-  async sendTurn(req: TurnRequest): Promise<TurnResult> {
+  async sendTurn(req: TurnRequest, _opts?: TurnOptions): Promise<TurnResult> {
     this.turns.push({ ...req });
     const text = await this.responder(req);
     return { text, messages: [{ role: "assistant", content: text }] };
@@ -79,7 +84,7 @@ export class ClaudeCodeAdapter implements HostAdapter {
     extraArgs?: string[];
   } = {}) { this.exec = opts.exec ?? defaultExec; }
 
-  async sendTurn(req: TurnRequest): Promise<TurnResult> {
+  async sendTurn(req: TurnRequest, turnOpts: TurnOptions = {}): Promise<TurnResult> {
     const systemPrompt = req.systemPrompt ?? "";
     // A changed system prompt only applies in a new session, so start one rather than silently resuming the old snapshot.
     if (this.sessionId && systemPrompt !== this.sessionSystemPrompt) this.sessionId = undefined;
@@ -89,7 +94,9 @@ export class ClaudeCodeAdapter implements HostAdapter {
     if (this.opts.permissionMode) args.push("--permission-mode", this.opts.permissionMode);
     if (this.sessionId) args.push("--resume", this.sessionId);
     if (this.opts.extraArgs) args.push(...this.opts.extraArgs);
-    const { stdout } = await this.exec(this.opts.bin ?? "claude", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024, env: this.opts.env });
+    const { stdout } = await this.exec(this.opts.bin ?? "claude", args, {
+      cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024, env: this.opts.env, signal: turnOpts.signal,
+    });
     const parsed = JSON.parse(stdout) as ClaudeResult;
     if (parsed.session_id) { this.sessionId = parsed.session_id; this.sessionSystemPrompt = systemPrompt; }
     if (parsed.is_error) throw new Error(`claude turn error (${parsed.subtype ?? "unknown"}): ${parsed.result ?? ""}`);
@@ -114,7 +121,7 @@ export class CodexAdapter implements HostAdapter {
     extraArgs?: string[];
   } = {}) { this.exec = opts.exec ?? defaultExec; }
 
-  async sendTurn(req: TurnRequest): Promise<TurnResult> {
+  async sendTurn(req: TurnRequest, turnOpts: TurnOptions = {}): Promise<TurnResult> {
     // Default workspace-write so implementation steps can edit files; read-only for review-only workflows.
     const args = ["exec", "--json", "--skip-git-repo-check", "--sandbox", this.opts.sandbox ?? "workspace-write"];
     // Config override (source-attested; not run-verified here): headless runs must not block on approval prompts.
@@ -123,7 +130,9 @@ export class CodexAdapter implements HostAdapter {
     const model = req.model ?? this.opts.model;
     if (model) args.push("-m", model);
     args.push(req.systemPrompt ? `${req.systemPrompt}\n\n${req.prompt}` : req.prompt);
-    const { stdout } = await this.exec(this.opts.bin ?? "codex", args, { cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024, env: this.opts.env });
+    const { stdout } = await this.exec(this.opts.bin ?? "codex", args, {
+      cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024, env: this.opts.env, signal: turnOpts.signal,
+    });
     let text = "";
     for (const line of stdout.split("\n")) {
       if (!line.trim()) continue;

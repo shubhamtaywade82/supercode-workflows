@@ -60,6 +60,7 @@ Variables: `$prompt`, `$systemPrompt`, `$response`, `$packedResponses`, `$model`
 - `js` snippets run in `node:vm` with a timeout. `vm` is not a security boundary.
 - `url` updaters and conditions send the current prompt and response to the URL you configure.
 - Steps marked `requireConfirm` are denied unless a `confirm` callback approves them.
+- Agent turns and shell steps run as the leader of their own process group. A timeout or abort ends the whole group (SIGTERM, then SIGKILL after a grace period) before the step fails, so no child process keeps writing to the project after a reported failure. Hosts receive an abort signal and must honor it; if a host does not confirm the stop within `abortConfirmMs`, the step fails anyway.
 
 ## License
 

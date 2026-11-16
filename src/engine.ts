@@ -1,5 +1,5 @@
 import { evalCondition, execShell, interpolate, resolveUpdater, StepTimeoutError } from "./updaters.js";
-import type { AiClient, ConfirmPreview, EngineEvent, HostAdapter, Registry, RunResult, Step, WorkflowState } from "./types.js";
+import type { AiClient, ConfirmPreview, EngineEvent, HostAdapter, Registry, RunResult, Step, TurnRequest, TurnResult, WorkflowState } from "./types.js";
 
 export interface EngineOptions {
   host: HostAdapter;
@@ -12,22 +12,16 @@ export interface EngineOptions {
   maxDepth?: number;        // default 8 (nesting / recursion)
   maxDurationMs?: number;   // default 30 min
   stepTimeoutMs?: number;   // default 5 min
+  abortConfirmMs?: number;  // after a turn times out, how long the host gets to confirm it stopped; default 10 s
   onEvent?: (e: EngineEvent) => void;
 }
 
 interface RunCtx { name: string; state: WorkflowState; steps: number; started: number; deadline: number; maxSteps: number }
 
-async function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    return await Promise.race([p, new Promise<never>((_, rej) => {
-      timer = setTimeout(() => rej(new StepTimeoutError(`${label} timed out after ${ms}ms`)), ms);
-    })]);
-  } finally { if (timer) clearTimeout(timer); }
-}
+const EXPIRED: unique symbol = Symbol("expired");
 
 export class WorkflowEngine {
-  private readonly o: EngineOptions & Required<Pick<EngineOptions, "maxSteps" | "maxDepth" | "maxDurationMs" | "stepTimeoutMs">>;
+  private readonly o: EngineOptions & Required<Pick<EngineOptions, "maxSteps" | "maxDepth" | "maxDurationMs" | "stepTimeoutMs" | "abortConfirmMs">>;
 
   constructor(opts: EngineOptions) {
     // Explicit `?? default` per field: a caller passing `maxSteps: undefined` must not disable the budget.
@@ -37,6 +31,7 @@ export class WorkflowEngine {
       maxDepth: opts.maxDepth ?? 8,
       maxDurationMs: opts.maxDurationMs ?? 30 * 60_000,
       stepTimeoutMs: opts.stepTimeoutMs ?? 5 * 60_000,
+      abortConfirmMs: opts.abortConfirmMs ?? 10_000,
     };
   }
 
@@ -58,6 +53,34 @@ export class WorkflowEngine {
     await this.execStep(wf, ctx, 0, true);
     this.emit({ type: "workflow:end", workflow: name, detail: { steps: ctx.steps } });
     return { state, stepsExecuted: ctx.steps, durationMs: Date.now() - ctx.started };
+  }
+
+  /**
+   * One agent turn under a deadline. On expiry the host is told to stop through the abort signal, then gets a bounded
+   * window to confirm its agent process tree is gone. Only after that does the step fail. A host that ignores the signal
+   * cannot hang the engine: the window expires and the step fails anyway.
+   */
+  private async runTurn(req: TurnRequest, label: string, ms: number): Promise<TurnResult> {
+    const ac = new AbortController();
+    const pending = this.o.host.sendTurn(req, { signal: ac.signal });
+    pending.catch(() => undefined); // a late rejection after expiry must not surface as unhandled
+    let expiry: NodeJS.Timeout | undefined;
+    const expired = new Promise<typeof EXPIRED>((resolve) => {
+      expiry = setTimeout(() => { ac.abort(); resolve(EXPIRED); }, ms);
+    });
+    try {
+      const first = await Promise.race([pending, expired]);
+      if (first !== EXPIRED) return first;
+    } finally {
+      clearTimeout(expiry);
+    }
+    let grace: NodeJS.Timeout | undefined;
+    await Promise.race([
+      pending.then(() => undefined, () => undefined),
+      new Promise<void>((resolve) => { grace = setTimeout(resolve, this.o.abortConfirmMs); }),
+    ]);
+    clearTimeout(grace);
+    throw new StepTimeoutError(`agent turn "${label}" timed out after ${ms}ms`);
   }
 
   private emit(e: EngineEvent): void { this.o.onEvent?.(e); }
@@ -113,9 +136,9 @@ export class WorkflowEngine {
       if (r.code !== 0 && !step.continueOnError) throw new Error(`shell step "${label}" exited ${r.code}: ${r.stderr.trim()}`);
     } else if (wantsTurn) {
       this.emit({ type: "turn:start", workflow: ctx.name, step: label, detail: { model: s.model, mode: s.mode } });
-      const res = await withTimeout(this.o.host.sendTurn({
+      const res = await this.runTurn({
         prompt: s.prompt, systemPrompt: s.systemPrompt || undefined, model: s.model || undefined, mode: s.mode || undefined,
-      }), t, `agent turn "${label}"`);
+      }, label, t);
       s.response = res.text;
       s.packed.push(...(res.messages?.length ? res.messages : [{ role: "assistant" as const, content: res.text }]));
       this.emit({ type: "turn:end", workflow: ctx.name, step: label });
