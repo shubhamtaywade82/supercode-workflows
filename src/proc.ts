@@ -33,10 +33,8 @@ export function onGroupEvent(listener: (e: GroupEvent) => void): () => void {
 
 const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** /proc is authoritative where it exists. In practice that means Linux. */
-function procAvailable(): boolean {
-  return process.platform === "linux" && fs.existsSync("/proc/self/stat");
-}
+/** /proc is authoritative where it exists. In practice that means Linux. Evaluated once, at module load. */
+const PROC_AVAILABLE = process.platform === "linux" && fs.existsSync("/proc/self/stat");
 
 /** Linux /proc facts about one process. Undefined when /proc is unavailable or the process has no entry. */
 export interface ProcStat {
@@ -47,7 +45,7 @@ export interface ProcStat {
 }
 
 export function readProcStat(pid: number): ProcStat | undefined {
-  if (!procAvailable()) return undefined;
+  if (!PROC_AVAILABLE) return undefined;
   try {
     const raw = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
     // "pid (comm) state ppid pgrp ... starttime": comm may hold spaces and parentheses, so anchor on the last ")".
@@ -65,7 +63,7 @@ export function readProcStat(pid: number): ProcStat | undefined {
  * That fails closed: the lock blocks rather than reclaiming.
  */
 export function processAlive(pid: number, starttime?: number): boolean {
-  if (procAvailable()) {
+  if (PROC_AVAILABLE) {
     const st = readProcStat(pid);
     if (!st) return false;
     if (st.state.startsWith("Z") || st.state.startsWith("X")) return false;
@@ -87,7 +85,7 @@ interface Member { pid: number; state: string }
  * group would look alive for seconds, or forever.
  */
 function groupMembers(pgid: number): Member[] {
-  if (procAvailable()) {
+  if (PROC_AVAILABLE) {
     const members: Member[] = [];
     for (const entry of fs.readdirSync("/proc")) {
       if (!/^\d+$/.test(entry)) continue;
@@ -123,7 +121,7 @@ export type GroupStatus = "empty" | "ours" | "unverifiable";
  */
 export function groupStatus(pgid: number, leaderStart?: number): GroupStatus {
   if (!groupAlive(pgid)) return "empty";
-  if (!procAvailable()) return "unverifiable";
+  if (!PROC_AVAILABLE) return "unverifiable";
   const leader = readProcStat(pgid);
   if (!leader) return "unverifiable";
   if (leaderStart === undefined) return "unverifiable";
@@ -364,7 +362,7 @@ export function runProcess(bin: string, args: string[], opts: RunOptions = {}): 
           else if (!empty) reject(new Error(`process group ${pgid} survived SIGKILL; ${bin} may still be writing to the project`));
           else resolve({ code, stdout, stderr, aborted, timedOut, overflow });
         });
-      })();
+      })().catch((e: unknown) => settle(() => reject(e instanceof Error ? e : new Error(String(e)))));
     });
   });
 }

@@ -61,7 +61,10 @@ export function createLeafHost(o: LeafOptions, guard: RunGuard, onTurn?: () => v
   const env = { [DEPTH_ENV]: String(o.depth + 1), [TURN_BUDGET_ENV]: String(guard.turnsRemaining) };
   let inner: HostAdapter;
   if (o.kind === "claude") {
-    inner = new ClaudeCodeAdapter({ cwd: o.cwd, env, exec: o.exec, permissionMode: o.permissionMode, extraArgs: o.extraArgs });
+    // Headless by construction: nothing can answer a prompt, so prompts are denied rather than left waiting.
+    inner = new ClaudeCodeAdapter({
+      cwd: o.cwd, env, exec: o.exec, permissionMode: o.permissionMode, permissionPrompts: "none", extraArgs: o.extraArgs,
+    });
   } else if (o.kind === "codex") {
     inner = new CodexAdapter({ cwd: o.cwd, env, exec: o.exec, sandbox: o.sandbox, extraArgs: o.extraArgs });
   } else {

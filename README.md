@@ -55,7 +55,8 @@ Variables: `$prompt`, `$systemPrompt`, `$response`, `$packedResponses`, `$model`
 - Workflows are trusted code, as in any agent-automation system. Review workflow files before running them.
 - `shell` steps run under `/bin/bash` with your privileges.
 - `--host codex` runs `codex exec` with `--sandbox workspace-write` and `approval_policy="never"` by default. Agent steps can edit files in the project, and actions that would need an approval prompt fail instead of blocking the run. The sandbox and approval flags were checked against the Codex source, not against a live run.
-- `--host claude` uses the CLI's own permission mode unless `--permission-mode` is given. Run autonomous workflows in an isolated checkout or runner.
+- `--host claude` requires an explicit `--permission-mode`. The CLI refuses a Claude run without one, before anything is spawned. Headless Claude turns pass `--permission-prompts none` (Claude Code 2.1.259 or later), so a prompt that nobody can answer is denied instead of waiting. Run autonomous workflows in an isolated checkout or runner.
+- Agent turns and shell steps run in the project directory (`--dir`). Before this was fixed, the CLI ran them in the process's working directory.
 - Claude captures `--append-system-prompt` on a session's first request. `ClaudeCodeAdapter` starts a new session whenever a step's system prompt differs from the current session's, so per-step `systemPrompt` values take effect. The cost is that Claude's internal conversation memory resets at that point. Cross-step context is carried by `$packedResponses`.
 - `js` snippets run in `node:vm` with a timeout. `vm` is not a security boundary.
 - `url` updaters and conditions send the current prompt and response to the URL you configure.

@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { ClaudeCodeAdapter, CodexAdapter, EchoHost, OllamaAi, OpenAiCompatAi, WorkflowEngine, loadWorkflows } from "./index.js";
+import { resolve } from "node:path";
 import type { AiClient, HostAdapter } from "./types.js";
 
 function flag(args: string[], name: string): string | undefined {
@@ -24,7 +25,9 @@ function enumFlag<T extends string>(args: string[], name: string, allowed: reado
 
 const args = process.argv.slice(2);
 const cmd = args[0];
-const { registry, env } = loadWorkflows({ projectRoot: flag(args, "dir") });
+// The project root is where workflows are read from, and the working directory for every agent turn and shell step.
+const projectDir = resolve(flag(args, "dir") ?? process.cwd());
+const { registry, env } = loadWorkflows({ projectRoot: projectDir });
 
 if (cmd === "list") {
   for (const [name, wf] of registry) {
@@ -43,9 +46,13 @@ if (cmd === "list") {
   const permissionMode = enumFlag(args, "permission-mode", ["default", "acceptEdits", "bypassPermissions", "plan"] as const);
   if (sandbox && hostKind !== "codex") fail("--sandbox applies only to --host codex");
   if (permissionMode && hostKind !== "claude") fail("--permission-mode applies only to --host claude");
+  // Claude runs here are autonomous. Refuse before anything is spawned, rather than let a prompt stall or a default decide.
+  if (hostKind === "claude" && permissionMode === undefined) {
+    fail("Autonomous edits require an explicit --permission-mode (e.g., acceptEdits).");
+  }
   const host: HostAdapter =
-    hostKind === "claude" ? new ClaudeCodeAdapter({ permissionMode }) :
-    hostKind === "codex" ? new CodexAdapter({ sandbox }) :
+    hostKind === "claude" ? new ClaudeCodeAdapter({ cwd: projectDir, permissionMode, permissionPrompts: "none" }) :
+    hostKind === "codex" ? new CodexAdapter({ cwd: projectDir, sandbox }) :
     new EchoHost();
   const aiKind = flag(args, "ai");
   const ai: AiClient | undefined =
@@ -54,7 +61,7 @@ if (cmd === "list") {
     undefined;
   const jsonEvents = args.includes("--json-events");
   const engine = new WorkflowEngine({
-    host, registry, ai, env,
+    host, registry, ai, env, cwd: projectDir,
     onEvent: e => {
       if (jsonEvents) console.error(JSON.stringify(e));
       else console.error(`[${e.type}] ${e.workflow ?? ""} ${e.step ?? ""} ${e.reason ?? ""}`.trimEnd());

@@ -37,6 +37,8 @@ export interface RuntimeOptions {
 export interface Runtime {
   readonly projectDir: string;
   readonly hostKind: HostKind;
+  /** The permission mode the leaf CLI runs in. Undefined means none was set, which refuses side-effecting Claude runs. */
+  readonly permissionMode?: LeafPermissionMode;
   readonly guard: RunGuard;
   readonly tokens: ConfirmTokens;
   readonly maxResponseChars: number;
@@ -77,6 +79,7 @@ export function createRuntime(o: RuntimeOptions = {}): Runtime {
   return {
     projectDir,
     hostKind,
+    permissionMode: leaf.permissionMode,
     guard,
     tokens,
     maxResponseChars: o.maxResponseChars ?? DEFAULT_MAX_RESPONSE_CHARS,

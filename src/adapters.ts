@@ -82,18 +82,26 @@ export class ClaudeCodeAdapter implements HostAdapter {
     env?: Record<string, string>;
     /** Extra CLI arguments appended to every turn (e.g. isolation flags once verified against your CLI version). */
     extraArgs?: string[];
+    /**
+     * "none": a permission prompt is denied instead of waiting for a human who is not there. Needs Claude Code 2.1.259 or
+     * later; older CLIs reject the flag. Only the runner knows whether it is headless, so this is opt-in here.
+     */
+    permissionPrompts?: "host" | "none";
   } = {}) { this.exec = opts.exec ?? defaultExec; }
 
   async sendTurn(req: TurnRequest, turnOpts: TurnOptions = {}): Promise<TurnResult> {
     const systemPrompt = req.systemPrompt ?? "";
     // A changed system prompt only applies in a new session, so start one rather than silently resuming the old snapshot.
     if (this.sessionId && systemPrompt !== this.sessionSystemPrompt) this.sessionId = undefined;
-    const args = ["-p", req.prompt, "--output-format", "json"];
+    // The prompt goes last, after every option, so no option can be read as part of the prompt.
+    const args = ["-p", "--output-format", "json"];
     if (req.model) args.push("--model", req.model);
     if (systemPrompt) args.push("--append-system-prompt", systemPrompt);
     if (this.opts.permissionMode) args.push("--permission-mode", this.opts.permissionMode);
     if (this.sessionId) args.push("--resume", this.sessionId);
+    if (this.opts.permissionPrompts) args.push("--permission-prompts", this.opts.permissionPrompts);
     if (this.opts.extraArgs) args.push(...this.opts.extraArgs);
+    args.push(req.prompt);
     const { stdout } = await this.exec(this.opts.bin ?? "claude", args, {
       cwd: this.opts.cwd, maxBuffer: 64 * 1024 * 1024, env: this.opts.env, signal: turnOpts.signal,
     });

@@ -88,6 +88,10 @@ export async function runWorkflow(rt: Runtime, input: RunInput): Promise<RunResu
     );
   }
 
+  // Claude edits autonomously. Without an explicit permission mode the outcome would depend on a default, so refuse.
+  if (preview.sideEffects && rt.hostKind === "claude" && rt.permissionMode === undefined) {
+    throw new ToolError("Autonomous edits require an explicit --permission-mode (e.g., acceptEdits).");
+  }
   // Windows cannot end an agent's process tree, so an abort could not be guaranteed. Refuse rather than degrade.
   if (preview.sideEffects && process.platform === "win32") {
     throw new ToolError(

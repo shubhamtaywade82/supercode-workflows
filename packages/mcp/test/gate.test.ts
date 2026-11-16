@@ -61,3 +61,15 @@ test("side-effecting runs are refused on Windows before any lock or token is tou
   // The refusal happened before the token was consumed, so the same token still works on a supported platform.
   assert.equal((await runWorkflow(rt, { name: "Plan", prompt: "x", allow_side_effects: true, confirm_token: token })).response, "done");
 });
+
+test("Claude edits without an explicit permission mode are refused, and read-only runs still work", async () => {
+  const dir = await makeProject();
+  const unset = makeRuntime(dir, okExec, { leaf: { exec: okExec } }); // no permissionMode
+  const token = previewRun(unset, { name: "Plan", prompt: "x" }).confirm_token ?? "";
+  await assert.rejects(
+    runWorkflow(unset, { name: "Plan", prompt: "x", allow_side_effects: true, confirm_token: token }),
+    (e: unknown) => e instanceof ToolError && /explicit --permission-mode/.test(e.message),
+  );
+  const readOnly = await runWorkflow(unset, { name: "Empty", prompt: "x", allow_side_effects: false });
+  assert.equal(readOnly.response, "");
+});

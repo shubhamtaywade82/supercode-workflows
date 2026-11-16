@@ -37,7 +37,7 @@ export function makeRuntime(dir: string, exec: ExecFn, extra: RuntimeOptions = {
     homeDir: path.join(dir, "no-home"),
     hostKind: "claude",
     env: {},
-    leaf: { exec },
+    leaf: { exec, permissionMode: "acceptEdits" },
     ...extra,
   });
 }
