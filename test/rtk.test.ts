@@ -16,6 +16,8 @@ interface StubSpec {
   rewriteExit: number;
   /** Stdout of `rtk rewrite`, verbatim. */
   rewriteOut: string;
+  /** Stderr of `rtk rewrite`, verbatim. */
+  rewriteErr?: string;
 }
 
 interface Stub { bin: string; log: string; command: string }
@@ -30,12 +32,14 @@ function stubRtk(spec: StubSpec): Stub {
   const command = path.join(dir, "command.txt");
   const out = path.join(dir, "rewrite.out");
   writeFileSync(out, spec.rewriteOut);
+  const err = path.join(dir, "rewrite.err");
+  writeFileSync(err, spec.rewriteErr ?? "");
   const bin = path.join(dir, "rtk");
   writeFileSync(bin, [
     "#!/bin/sh",
     "case \"$1\" in",
     `  --version) printf 'version telemetry=%s\\n' "$RTK_TELEMETRY_DISABLED" >> '${log}'; echo "rtk stub"; exit ${spec.version ?? 0} ;;`,
-    `  rewrite) printf 'rewrite argc=%s telemetry=%s\\n' "$#" "$RTK_TELEMETRY_DISABLED" >> '${log}'; printf '%s' "$2" > '${command}'; cat '${out}'; exit ${spec.rewriteExit} ;;`,
+    `  rewrite) printf 'rewrite argc=%s telemetry=%s\\n' "$#" "$RTK_TELEMETRY_DISABLED" >> '${log}'; printf '%s' "$2" > '${command}'; cat '${out}'; cat '${err}' >&2; exit ${spec.rewriteExit} ;;`,
     `  *) printf 'unexpected argv=%s\\n' "$*" >> '${log}'; exit 98 ;;`,
     "esac",
     "",
@@ -118,6 +122,28 @@ test("exit 1 (no rewrite) runs the original command unchanged", async () => {
   const e = shellEngine([{ name: "s", shell: "printf ORIGINAL", rtk: true }], new RtkAdapter({ bin: stub.bin }));
   const r = await e.run("W", { prompt: "P" });
   assert.equal(r.state.response, "ORIGINAL");
+});
+
+test("exit 1 with empty stdout and no marker passes the original through", async () => {
+  const stub = stubRtk({ rewriteExit: 1, rewriteOut: "" });
+  assert.equal(await new RtkAdapter({ bin: stub.bin }).prepare("echo a"), "echo a");
+});
+
+test("exit 1 with rtk's integrity-check marker is refused, and the original does not run", async () => {
+  // Upstream's fallback dispatcher exits 1 with this message when its integrity check fails and the tool is never reached.
+  const original = path.join(workDir(), "original");
+  const stub = stubRtk({ rewriteExit: 1, rewriteOut: "", rewriteErr: "hook integrity check FAILED: tool not reached\n" });
+  const e = shellEngine([{ name: "s", shell: `touch ${original}`, rtk: true }], new RtkAdapter({ bin: stub.bin }));
+  await assert.rejects(e.run("W", { prompt: "P" }), isRtkError("integrity"));
+  assert.equal(existsSync(original), false, "the original command must not run");
+});
+
+test("exit 1 with stdout is anomalous under the pinned (1, \"\") contract, and nothing runs", async () => {
+  const original = path.join(workDir(), "original");
+  const stub = stubRtk({ rewriteExit: 1, rewriteOut: `touch ${original}` });
+  const e = shellEngine([{ name: "s", shell: `touch ${original}`, rtk: true }], new RtkAdapter({ bin: stub.bin }));
+  await assert.rejects(e.run("W", { prompt: "P" }), isRtkError("unexpected"));
+  assert.equal(existsSync(original), false, "the original command must not run");
 });
 
 /** A refused command must not run, in either form: the original or what rtk would have rewritten it to. */
